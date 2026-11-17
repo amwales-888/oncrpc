@@ -1,0 +1,35 @@
+# Build output (Linux: build/linux/...; Windows: build\x64\..., build\obj\...)
+/build/
+
+# Stray compiler output, in case anything is built outside build/
+*.o
+*.d
+*.a
+*.obj
+*.lib
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+ipch/
+x64/
+
+# vcpkg manifest mode installs libuv here on the first Windows build
+/vcpkg_installed/
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+

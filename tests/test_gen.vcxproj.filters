@@ -1,0 +1,31 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{A8769C68-3A5D-5ECD-9E22-E46BF857C164}</UniqueIdentifier>
+      <Extensions>c</Extensions>
+    </Filter>
+    <Filter Include="Generated Files">
+      <UniqueIdentifier>{97220B43-0C9F-5E9F-89CB-C2960B084EED}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Interface Files">
+      <UniqueIdentifier>{C32E97BF-33CC-5B26-A82B-13044A159C27}</UniqueIdentifier>
+      <Extensions>x</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="test_gen.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="$(IntDir)gen\alltypes_xdr.c">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="alltypes.x">
+      <Filter>Interface Files</Filter>
+    </CustomBuild>
+  </ItemGroup>
+</Project>

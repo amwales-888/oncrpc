@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{BE183C7C-5ED3-5D48-B3A5-AD1195098F54}</UniqueIdentifier>
+      <Extensions>c</Extensions>
+    </Filter>
+    <Filter Include="Generated Files">
+      <UniqueIdentifier>{EDE0C438-CEB6-5A13-89E7-053D26859A6C}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Interface Files">
+      <UniqueIdentifier>{24AC4C33-E5F6-56B8-B250-5B8D1D52ADAE}</UniqueIdentifier>
+      <Extensions>x</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="server.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="$(IntDir)gen\delay_xdr.c">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)gen\delay_svc.c">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="delay.x">
+      <Filter>Interface Files</Filter>
+    </CustomBuild>
+  </ItemGroup>
+</Project>

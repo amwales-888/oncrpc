@@ -1,0 +1,308 @@
+# Makefile-macOS - liboncrpc for macOS (EXPERIMENTAL, not yet tested on a Mac)
+#
+#   make -f Makefile-macOS             build the library, oncrpcgen and the examples
+#   make -f Makefile-macOS debug       the same with AddressSanitizer and UBSan, in
+#                                      build/macos/debug
+#   make -f Makefile-macOS lib         build only liboncrpc.a
+#   make -f Makefile-macOS check       build and run the tests and the examples
+#                                      ('make -f Makefile-macOS debug check' runs them
+#                                      under the sanitizers)
+#   make -f Makefile-macOS install     install oncrpcgen, the library and headers under
+#                                      $(PREFIX)
+#   make -f Makefile-macOS uninstall   remove what 'install' installed
+#   make -f Makefile-macOS clean       remove the macOS build output (build/macos);
+#                                      other systems' builds in build/ are left alone
+#
+# Needs the Xcode Command Line Tools (xcode-select --install) and, from
+# Homebrew:  brew install libuv pkg-config
+#
+# Variables you can override:  CC, CFLAGS, PREFIX, DESTDIR, V=1 (show full
+# commands), ARCHFLAGS (e.g. "-arch arm64 -arch x86_64" for universal
+# binaries, which needs a universal build of libuv as well; see BUILDING.md).
+#
+# Written for the GNU make 3.81 that comes with macOS: no feature newer than
+# that is used.
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+CC         ?= cc
+PKG_CONFIG ?= pkg-config
+NM         ?= nm
+PREFIX     ?= /usr/local
+ARCHFLAGS  ?=
+DESTDIR    ?=
+
+BINDIR     := $(PREFIX)/bin
+LIBDIR     := $(PREFIX)/lib
+INCLUDEDIR := $(PREFIX)/include/oncrpc
+
+PROGRAM    := oncrpcgen
+LIBRARY    := liboncrpc.a
+
+SRCDIR      := src
+
+LIB_SOURCES := xdr.c auth.c error.c client.c pmap.c server.c xparse.c xgen.c
+APP_SOURCES := oncrpcgen.c
+HEADERS     := oncrpc.h xdr.h xspec.h
+ALL_HEADERS := $(HEADERS) internal.h
+
+# The client/server examples, as directory:name-of-the-.x-file. 08_xdr (XDR
+# only, no networking) is built separately below.
+RPC_EXAMPLES := 01_add:add 02_strings:greet 03_shapes:shapes 04_lists:lists \
+                05_async:delay 06_portmap:clock 07_errors:secure
+
+PKGS := libuv
+
+# Fail early with a clear message if a dependency is missing.
+ifeq ($(filter clean uninstall,$(MAKECMDGOALS)),)
+  ifneq ($(shell $(PKG_CONFIG) --exists $(PKGS) && echo yes),yes)
+    $(error Missing libuv or pkg-config. With Homebrew: \
+            brew install libuv pkg-config)
+  endif
+  PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS))
+  PKG_LIBS   := $(shell $(PKG_CONFIG) --libs $(PKGS))
+endif
+
+# No _POSIX_C_SOURCE here (unlike Makefile-Linux): on macOS it hides the BSD
+# interfaces that the system headers rely on. _DARWIN_C_SOURCE keeps them
+# visible.
+CPPFLAGS += -D_DARWIN_C_SOURCE -I$(SRCDIR)
+CFLAGS   ?= -O2 -g
+CFLAGS   += -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Wconversion
+CFLAGS   += -MMD -MP $(ARCHFLAGS) $(PKG_CFLAGS)
+LDFLAGS  += $(ARCHFLAGS)
+LDLIBS   += $(PKG_LIBS)
+
+# Output goes under build/macos (release builds in build/macos/release, debug
+# builds in build/macos/debug), apart from other systems' builds.
+BUILDROOT := build/macos
+BUILD := $(BUILDROOT)/release
+ifneq ($(filter debug,$(MAKECMDGOALS)),)
+  BUILD   := $(BUILDROOT)/debug
+  CFLAGS  += -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
+  LDFLAGS += -fsanitize=address,undefined
+endif
+
+OBJDIR      := $(BUILD)/obj
+EXDIR       := $(BUILD)/examples
+TESTDIR     := $(BUILD)/tests
+LIB_OBJECTS := $(LIB_SOURCES:%.c=$(OBJDIR)/%.o)
+APP_OBJECTS := $(APP_SOURCES:%.c=$(OBJDIR)/%.o)
+
+example_dir  = $(word 1,$(subst :, ,$(1)))
+example_name = $(word 2,$(subst :, ,$(1)))
+EXAMPLE_PROGRAMS := $(foreach e,$(RPC_EXAMPLES),\
+                      $(EXDIR)/$(call example_dir,$(e))/server \
+                      $(EXDIR)/$(call example_dir,$(e))/client) \
+                    $(EXDIR)/08_xdr/xdr_demo
+TEST_PROGRAMS := $(TESTDIR)/test_xdr $(TESTDIR)/test_xspec $(TESTDIR)/test_gen \
+                 $(TESTDIR)/test_rpc
+
+# Quiet output; 'make V=1' shows full commands.
+ifeq ($(V),1)
+  Q :=
+  say :=
+else
+  Q := @
+  say = @printf '  %-6s %s\n' $(1) $(2);
+endif
+
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
+
+.PHONY: all debug lib examples check check-alloc install uninstall clean
+
+all: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(EXAMPLE_PROGRAMS)
+	$(Q)ln -sf $(BUILD)/$(PROGRAM) $(PROGRAM)
+
+debug: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(EXAMPLE_PROGRAMS)
+	@echo "Debug build: $(BUILD)"
+
+lib: $(BUILD)/$(LIBRARY)
+
+examples: $(EXAMPLE_PROGRAMS)
+
+# The library and the code generator
+
+$(BUILD)/$(LIBRARY): $(LIB_OBJECTS)
+	$(call say,AR,$@)
+	$(Q)rm -f $@
+	$(Q)$(AR) rcs $@ $^
+
+# oncrpcgen uses only the XDR, parser and generator parts: no libuv.
+$(BUILD)/$(PROGRAM): $(APP_OBJECTS) $(BUILD)/$(LIBRARY)
+	$(call say,LINK,$@)
+	$(Q)$(CC) $(LDFLAGS) -o $@ $(APP_OBJECTS) $(BUILD)/$(LIBRARY)
+
+$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(OBJDIR):
+	$(Q)mkdir -p $@
+
+# ---------------------------------------------------------------------------
+# Examples: examples/<dir>/<name>.x is compiled by oncrpcgen into
+# build/macos/<release|debug>/examples/<dir>/, where server.c and client.c are
+# built against the generated code.
+# ---------------------------------------------------------------------------
+
+# $(1) = example directory, $(2) = name of its .x file
+define RPC_EXAMPLE
+$(EXDIR)/$(1)/.generated: examples/$(1)/$(2).x $(BUILD)/$(PROGRAM)
+	$$(call say,GEN,examples/$(1)/$(2).x)
+	$(Q)mkdir -p $(EXDIR)/$(1)
+	$(Q)$(BUILD)/$(PROGRAM) -o $(EXDIR)/$(1) examples/$(1)/$(2).x
+	$(Q)touch $$@
+
+$(EXDIR)/$(1)/$(2).h $(EXDIR)/$(1)/$(2)_xdr.c $(EXDIR)/$(1)/$(2)_clnt.c \
+$(EXDIR)/$(1)/$(2)_svc.c: $(EXDIR)/$(1)/.generated ;
+
+$(EXDIR)/$(1)/%.o: $(EXDIR)/$(1)/%.c
+	$$(call say,CC,$$<)
+	$(Q)$(CC) $(CPPFLAGS) -I$(EXDIR)/$(1) $(CFLAGS) -c -o $$@ $$<
+
+$(EXDIR)/$(1)/%.o: examples/$(1)/%.c $(EXDIR)/$(1)/.generated
+	$$(call say,CC,$$<)
+	$(Q)$(CC) $(CPPFLAGS) -I$(EXDIR)/$(1) $(CFLAGS) -c -o $$@ $$<
+
+$(EXDIR)/$(1)/server: $(EXDIR)/$(1)/server.o $(EXDIR)/$(1)/$(2)_xdr.o \
+                      $(EXDIR)/$(1)/$(2)_svc.o $(BUILD)/$(LIBRARY)
+	$$(call say,LINK,$$@)
+	$(Q)$(CC) $(LDFLAGS) -o $$@ $$(filter %.o,$$^) $(BUILD)/$(LIBRARY) $(LDLIBS) -lm
+
+$(EXDIR)/$(1)/client: $(EXDIR)/$(1)/client.o $(EXDIR)/$(1)/$(2)_xdr.o \
+                      $(EXDIR)/$(1)/$(2)_clnt.o $(BUILD)/$(LIBRARY)
+	$$(call say,LINK,$$@)
+	$(Q)$(CC) $(LDFLAGS) -o $$@ $$(filter %.o,$$^) $(BUILD)/$(LIBRARY) $(LDLIBS) -lm
+endef
+
+$(foreach e,$(RPC_EXAMPLES),\
+  $(eval $(call RPC_EXAMPLE,$(call example_dir,$(e)),$(call example_name,$(e)))))
+
+# 08_xdr has no program: only the header and XDR routines, and no libuv.
+$(EXDIR)/08_xdr/.generated: examples/08_xdr/readings.x $(BUILD)/$(PROGRAM)
+	$(call say,GEN,examples/08_xdr/readings.x)
+	$(Q)mkdir -p $(EXDIR)/08_xdr
+	$(Q)$(BUILD)/$(PROGRAM) -h -c -o $(EXDIR)/08_xdr examples/08_xdr/readings.x
+	$(Q)touch $@
+
+$(EXDIR)/08_xdr/readings.h $(EXDIR)/08_xdr/readings_xdr.c: $(EXDIR)/08_xdr/.generated ;
+
+$(EXDIR)/08_xdr/readings_xdr.o: $(EXDIR)/08_xdr/readings_xdr.c
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) -I$(EXDIR)/08_xdr $(CFLAGS) -c -o $@ $<
+
+$(EXDIR)/08_xdr/main.o: examples/08_xdr/main.c $(EXDIR)/08_xdr/.generated
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) -I$(EXDIR)/08_xdr $(CFLAGS) -c -o $@ $<
+
+$(EXDIR)/08_xdr/xdr_demo: $(EXDIR)/08_xdr/main.o $(EXDIR)/08_xdr/readings_xdr.o $(BUILD)/$(LIBRARY)
+	$(call say,LINK,$@)
+	$(Q)$(CC) $(LDFLAGS) -o $@ $(filter %.o,$^) $(BUILD)/$(LIBRARY)
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+$(TESTDIR):
+	$(Q)mkdir -p $@
+
+$(TESTDIR)/%.o: tests/%.c | $(TESTDIR)
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(TESTDIR)/test_xdr: $(TESTDIR)/test_xdr.o $(BUILD)/$(LIBRARY)
+	$(call say,LINK,$@)
+	$(Q)$(CC) $(LDFLAGS) -o $@ $< $(BUILD)/$(LIBRARY) $(LDLIBS)
+
+$(TESTDIR)/test_xspec: $(TESTDIR)/test_xspec.o $(BUILD)/$(LIBRARY)
+	$(call say,LINK,$@)
+	$(Q)$(CC) $(LDFLAGS) -o $@ $< $(BUILD)/$(LIBRARY) $(LDLIBS)
+
+# test_gen round-trips every declaration form through generated code. The
+# generated client, server and both skeletons are also built, with -Werror.
+$(TESTDIR)/alltypes/.generated: tests/alltypes.x $(BUILD)/$(PROGRAM)
+	$(call say,GEN,tests/alltypes.x)
+	$(Q)mkdir -p $(TESTDIR)/alltypes
+	$(Q)$(BUILD)/$(PROGRAM) -a -S -C -f -o $(TESTDIR)/alltypes tests/alltypes.x
+	$(Q)touch $@
+
+$(addprefix $(TESTDIR)/alltypes/alltypes,.h _xdr.c _clnt.c _svc.c _server_skel.c _client_skel.c): \
+    $(TESTDIR)/alltypes/.generated ;
+
+$(TESTDIR)/alltypes/%.o: $(TESTDIR)/alltypes/%.c
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -Werror -c -o $@ $<
+
+ALLTYPES := $(TESTDIR)/alltypes/alltypes
+$(TESTDIR)/test_gen: tests/test_gen.c $(ALLTYPES)_xdr.o $(ALLTYPES)_clnt.o $(ALLTYPES)_svc.o \
+                     $(ALLTYPES)_server_skel.o $(ALLTYPES)_client_skel.o $(BUILD)/$(LIBRARY)
+	$(call say,LINK,$(ALLTYPES)_server)
+	$(Q)$(CC) $(LDFLAGS) -o $(ALLTYPES)_server $(ALLTYPES)_server_skel.o $(ALLTYPES)_svc.o \
+	    $(ALLTYPES)_xdr.o $(BUILD)/$(LIBRARY) $(LDLIBS)
+	$(call say,LINK,$(ALLTYPES)_client)
+	$(Q)$(CC) $(LDFLAGS) -o $(ALLTYPES)_client $(ALLTYPES)_client_skel.o $(ALLTYPES)_clnt.o \
+	    $(ALLTYPES)_xdr.o $(BUILD)/$(LIBRARY) $(LDLIBS)
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/alltypes $(CFLAGS) -Werror $(LDFLAGS) -o $@ $< \
+	    $(ALLTYPES)_xdr.o $(BUILD)/$(LIBRARY) $(LDLIBS)
+
+# test_rpc runs a client and a server in one loop, using tests/calc.x.
+$(TESTDIR)/calc/.generated: tests/calc.x $(BUILD)/$(PROGRAM)
+	$(call say,GEN,tests/calc.x)
+	$(Q)mkdir -p $(TESTDIR)/calc
+	$(Q)$(BUILD)/$(PROGRAM) -o $(TESTDIR)/calc tests/calc.x
+	$(Q)touch $@
+
+$(addprefix $(TESTDIR)/calc/calc,.h _xdr.c _clnt.c _svc.c): $(TESTDIR)/calc/.generated ;
+
+$(TESTDIR)/calc/%.o: $(TESTDIR)/calc/%.c
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+$(TESTDIR)/test_rpc: tests/test_rpc.c $(TESTDIR)/calc/calc_xdr.o $(TESTDIR)/calc/calc_clnt.o \
+                     $(TESTDIR)/calc/calc_svc.o $(BUILD)/$(LIBRARY)
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/calc $(CFLAGS) $(LDFLAGS) -o $@ $< \
+	    $(filter %.o,$^) $(BUILD)/$(LIBRARY) $(LDLIBS)
+
+# The library must never call the C allocator: check what its objects import.
+check-alloc: $(LIB_OBJECTS)
+	$(Q)if $(NM) -u $(LIB_OBJECTS) | grep -Ew '_?(malloc|calloc|realloc|free|strdup|strndup|aligned_alloc|posix_memalign)$$'; then \
+	    echo "check-alloc: FAILED - the library references the C allocator"; exit 1; \
+	else echo "check-alloc: the library does not reference malloc/calloc/realloc/free"; fi
+
+check: $(TEST_PROGRAMS) $(EXAMPLE_PROGRAMS) check-alloc
+	$(Q)$(TESTDIR)/test_xdr
+	$(Q)$(TESTDIR)/test_xspec
+	$(Q)$(TESTDIR)/test_gen
+	$(Q)$(TESTDIR)/test_rpc
+	$(Q)sh tests/run_examples.sh $(EXDIR)
+
+# ---------------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------------
+
+install: all
+	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR)
+	install -m 755 $(BUILD)/$(PROGRAM) $(DESTDIR)$(BINDIR)/$(PROGRAM)
+	install -m 644 $(BUILD)/$(LIBRARY) $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	install -m 644 $(addprefix $(SRCDIR)/,$(HEADERS)) $(DESTDIR)$(INCLUDEDIR)/
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(PROGRAM)
+	rm -f $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	rm -f $(addprefix $(DESTDIR)$(INCLUDEDIR)/,$(HEADERS))
+	-rmdir $(DESTDIR)$(INCLUDEDIR) 2>/dev/null
+
+clean:
+	rm -rf $(BUILDROOT)
+	@if [ -L $(PROGRAM) ]; then rm -f $(PROGRAM); fi
+	@rmdir build 2>/dev/null || true
+
+# Header dependencies generated by -MMD.
+-include $(shell find $(BUILD) -name '*.d' 2>/dev/null)

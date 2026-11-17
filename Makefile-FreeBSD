@@ -1,0 +1,296 @@
+# Makefile-FreeBSD - liboncrpc for FreeBSD (the system's make)
+#
+#   make -f Makefile-FreeBSD             build the library, oncrpcgen and the examples
+#   make -f Makefile-FreeBSD debug       the same with AddressSanitizer and UBSan, in
+#                                        build/freebsd/debug
+#   make -f Makefile-FreeBSD lib         build only liboncrpc.a
+#   make -f Makefile-FreeBSD check       build and run the tests and the examples
+#                                        ('make -f Makefile-FreeBSD debug check' runs
+#                                        them under the sanitizers)
+#   make -f Makefile-FreeBSD install     install oncrpcgen, the library and headers under
+#                                        ${PREFIX} (as root, or with DESTDIR)
+#   make -f Makefile-FreeBSD uninstall   remove what 'install' installed
+#   make -f Makefile-FreeBSD clean       remove the FreeBSD build output
+#                                        (build/freebsd); Linux, macOS or Windows
+#                                        builds elsewhere in build/ are left alone
+#
+# Needs:  pkg install libuv pkgconf
+#
+# Variables you can override:  CC, CFLAGS, PREFIX, DESTDIR, LOCALBASE,
+# V=1 (show full commands). This file is written for FreeBSD's make (bmake);
+# GNU make users can use 'gmake -f Makefile-Linux' instead, which works on
+# FreeBSD too given the same packages.
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+PREFIX?=        /usr/local
+DESTDIR?=
+LOCALBASE?=     /usr/local
+PKG_CONFIG?=    pkgconf
+NM?=            nm
+
+BINDIR=         ${PREFIX}/bin
+LIBDIR=         ${PREFIX}/lib
+INCLUDEDIR=     ${PREFIX}/include/oncrpc
+
+PROGRAM=        oncrpcgen
+LIBRARY=        liboncrpc.a
+SRCDIR=         src
+
+LIB_SOURCES=    xdr.c auth.c error.c client.c pmap.c server.c xparse.c xgen.c
+APP_SOURCES=    oncrpcgen.c
+HEADERS=        oncrpc.h xdr.h xspec.h
+ALL_HEADERS=    ${HEADERS} internal.h
+
+# The client/server examples, as pairs of directory and name of the .x file.
+# 08_xdr (XDR only, no networking) is built separately below.
+RPC_EXAMPLES=   01_add add  02_strings greet  03_shapes shapes  04_lists lists \
+                05_async delay  06_portmap clock  07_errors secure
+
+# Release builds in build/freebsd/release, debug builds in build/freebsd/debug.
+BUILDROOT=      build/freebsd
+.if make(debug)
+BUILD=          ${BUILDROOT}/debug
+.else
+BUILD=          ${BUILDROOT}/release
+.endif
+OBJDIR=         ${BUILD}/obj
+EXDIR=          ${BUILD}/examples
+TESTDIR=        ${BUILD}/tests
+
+# libuv from packages: pkgconf if it knows it, else ${LOCALBASE}.
+.if !make(clean) && !make(uninstall)
+.  if !exists(${LOCALBASE}/include/uv.h)
+.    error libuv is not installed (${LOCALBASE}/include/uv.h is missing): pkg install libuv pkgconf
+.  endif
+UV_CFLAGS!=     ${PKG_CONFIG} --cflags libuv 2>/dev/null || echo -I${LOCALBASE}/include
+UV_LIBS!=       ${PKG_CONFIG} --libs libuv 2>/dev/null || echo -L${LOCALBASE}/lib -luv
+.endif
+
+# No global _POSIX_C_SOURCE here (unlike Makefile-Linux): on FreeBSD it would
+# hide the BSD interfaces the system headers themselves rely on, and the
+# default environment already has everything libuv needs.
+CFLAGS?=        -O2 -pipe
+CFLAGS+=        -g -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Wconversion
+CFLAGS+=        -I${SRCDIR} ${UV_CFLAGS}
+LDLIBS+=        ${UV_LIBS} -lpthread
+
+.if make(debug)
+CFLAGS+=        -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
+LDFLAGS+=       -fsanitize=address,undefined
+.endif
+
+.if defined(V) && ${V} == "1"
+Q=
+.else
+Q=              @
+.endif
+
+# ---------------------------------------------------------------------------
+# Targets
+# ---------------------------------------------------------------------------
+
+.PHONY: all debug lib examples check check-alloc install uninstall clean
+.MAIN: all
+
+LIB_OBJECTS=
+APP_OBJECTS=
+DEPEND_HEADERS= ${ALL_HEADERS:S,^,${SRCDIR}/,}
+
+# One rule per source file; every object depends on every header, which is
+# simple and always right (a full build takes seconds).
+.for source in ${LIB_SOURCES}
+LIB_OBJECTS+=   ${OBJDIR}/${source:R}.o
+${OBJDIR}/${source:R}.o: ${SRCDIR}/${source} ${DEPEND_HEADERS}
+	@mkdir -p ${OBJDIR}
+	@echo "  CC     ${SRCDIR}/${source}"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -c -o ${.TARGET} ${SRCDIR}/${source}
+.endfor
+.for source in ${APP_SOURCES}
+APP_OBJECTS+=   ${OBJDIR}/${source:R}.o
+${OBJDIR}/${source:R}.o: ${SRCDIR}/${source} ${DEPEND_HEADERS}
+	@mkdir -p ${OBJDIR}
+	@echo "  CC     ${SRCDIR}/${source}"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -c -o ${.TARGET} ${SRCDIR}/${source}
+.endfor
+
+${BUILD}/${LIBRARY}: ${LIB_OBJECTS}
+	@echo "  AR     ${.TARGET}"
+	${Q}rm -f ${.TARGET}
+	${Q}${AR} rcs ${.TARGET} ${LIB_OBJECTS}
+
+# oncrpcgen uses only the XDR, parser and generator parts: no libuv.
+${BUILD}/${PROGRAM}: ${APP_OBJECTS} ${BUILD}/${LIBRARY}
+	@echo "  LINK   ${.TARGET}"
+	${Q}${CC} ${LDFLAGS} -o ${.TARGET} ${APP_OBJECTS} ${BUILD}/${LIBRARY}
+
+# ---------------------------------------------------------------------------
+# Examples: examples/<dir>/<name>.x is compiled by oncrpcgen into
+# build/freebsd/<release|debug>/examples/<dir>/, where server.c and client.c
+# are built against the generated code.
+# ---------------------------------------------------------------------------
+
+EXAMPLE_PROGRAMS=
+
+.for dir name in ${RPC_EXAMPLES}
+EXAMPLE_PROGRAMS+= ${EXDIR}/${dir}/server ${EXDIR}/${dir}/client
+
+${EXDIR}/${dir}/.generated: examples/${dir}/${name}.x ${BUILD}/${PROGRAM}
+	@echo "  GEN    examples/${dir}/${name}.x"
+	@mkdir -p ${EXDIR}/${dir}
+	${Q}${BUILD}/${PROGRAM} -o ${EXDIR}/${dir} examples/${dir}/${name}.x
+	${Q}touch ${.TARGET}
+
+.  for part in ${name}_xdr ${name}_clnt ${name}_svc
+${EXDIR}/${dir}/${part}.o: ${EXDIR}/${dir}/.generated ${DEPEND_HEADERS}
+	@echo "  CC     ${EXDIR}/${dir}/${part}.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -I${EXDIR}/${dir} -c -o ${.TARGET} ${EXDIR}/${dir}/${part}.c
+.  endfor
+.  for part in server client
+${EXDIR}/${dir}/${part}.o: examples/${dir}/${part}.c ${EXDIR}/${dir}/.generated ${DEPEND_HEADERS}
+	@echo "  CC     examples/${dir}/${part}.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -I${EXDIR}/${dir} -c -o ${.TARGET} examples/${dir}/${part}.c
+.  endfor
+
+${EXDIR}/${dir}/server: ${EXDIR}/${dir}/server.o ${EXDIR}/${dir}/${name}_xdr.o \
+                        ${EXDIR}/${dir}/${name}_svc.o ${BUILD}/${LIBRARY}
+	@echo "  LINK   ${.TARGET}"
+	${Q}${CC} ${LDFLAGS} -o ${.TARGET} ${EXDIR}/${dir}/server.o ${EXDIR}/${dir}/${name}_xdr.o \
+	    ${EXDIR}/${dir}/${name}_svc.o ${BUILD}/${LIBRARY} ${LDLIBS} -lm
+
+${EXDIR}/${dir}/client: ${EXDIR}/${dir}/client.o ${EXDIR}/${dir}/${name}_xdr.o \
+                        ${EXDIR}/${dir}/${name}_clnt.o ${BUILD}/${LIBRARY}
+	@echo "  LINK   ${.TARGET}"
+	${Q}${CC} ${LDFLAGS} -o ${.TARGET} ${EXDIR}/${dir}/client.o ${EXDIR}/${dir}/${name}_xdr.o \
+	    ${EXDIR}/${dir}/${name}_clnt.o ${BUILD}/${LIBRARY} ${LDLIBS} -lm
+.endfor
+
+# 08_xdr has no program: only the header and XDR routines, and no libuv.
+EXAMPLE_PROGRAMS+= ${EXDIR}/08_xdr/xdr_demo
+
+${EXDIR}/08_xdr/.generated: examples/08_xdr/readings.x ${BUILD}/${PROGRAM}
+	@echo "  GEN    examples/08_xdr/readings.x"
+	@mkdir -p ${EXDIR}/08_xdr
+	${Q}${BUILD}/${PROGRAM} -h -c -o ${EXDIR}/08_xdr examples/08_xdr/readings.x
+	${Q}touch ${.TARGET}
+
+${EXDIR}/08_xdr/readings_xdr.o: ${EXDIR}/08_xdr/.generated ${DEPEND_HEADERS}
+	@echo "  CC     ${EXDIR}/08_xdr/readings_xdr.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -I${EXDIR}/08_xdr -c -o ${.TARGET} ${EXDIR}/08_xdr/readings_xdr.c
+
+${EXDIR}/08_xdr/main.o: examples/08_xdr/main.c ${EXDIR}/08_xdr/.generated ${DEPEND_HEADERS}
+	@echo "  CC     examples/08_xdr/main.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -I${EXDIR}/08_xdr -c -o ${.TARGET} examples/08_xdr/main.c
+
+${EXDIR}/08_xdr/xdr_demo: ${EXDIR}/08_xdr/main.o ${EXDIR}/08_xdr/readings_xdr.o ${BUILD}/${LIBRARY}
+	@echo "  LINK   ${.TARGET}"
+	${Q}${CC} ${LDFLAGS} -o ${.TARGET} ${EXDIR}/08_xdr/main.o ${EXDIR}/08_xdr/readings_xdr.o \
+	    ${BUILD}/${LIBRARY}
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+TEST_PROGRAMS=  ${TESTDIR}/test_xdr ${TESTDIR}/test_xspec ${TESTDIR}/test_gen \
+                ${TESTDIR}/test_rpc
+
+.for test in test_xdr test_xspec
+${TESTDIR}/${test}: tests/${test}.c ${BUILD}/${LIBRARY} ${DEPEND_HEADERS}
+	@mkdir -p ${TESTDIR}
+	@echo "  CC     tests/${test}.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} ${LDFLAGS} -o ${.TARGET} tests/${test}.c ${BUILD}/${LIBRARY} ${LDLIBS}
+.endfor
+
+# test_gen round-trips every declaration form through generated code. The
+# generated client, server and both skeletons are also built, with -Werror.
+ALLTYPES=       ${TESTDIR}/alltypes/alltypes
+
+${TESTDIR}/alltypes/.generated: tests/alltypes.x ${BUILD}/${PROGRAM}
+	@echo "  GEN    tests/alltypes.x"
+	@mkdir -p ${TESTDIR}/alltypes
+	${Q}${BUILD}/${PROGRAM} -a -S -C -f -o ${TESTDIR}/alltypes tests/alltypes.x
+	${Q}touch ${.TARGET}
+
+.for part in xdr clnt svc server_skel client_skel
+${ALLTYPES}_${part}.o: ${TESTDIR}/alltypes/.generated ${DEPEND_HEADERS}
+	@echo "  CC     ${ALLTYPES}_${part}.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -Werror -c -o ${.TARGET} ${ALLTYPES}_${part}.c
+.endfor
+
+${TESTDIR}/test_gen: tests/test_gen.c ${ALLTYPES}_xdr.o ${ALLTYPES}_clnt.o ${ALLTYPES}_svc.o \
+                     ${ALLTYPES}_server_skel.o ${ALLTYPES}_client_skel.o ${BUILD}/${LIBRARY}
+	@echo "  LINK   ${ALLTYPES}_server"
+	${Q}${CC} ${LDFLAGS} -o ${ALLTYPES}_server ${ALLTYPES}_server_skel.o ${ALLTYPES}_svc.o \
+	    ${ALLTYPES}_xdr.o ${BUILD}/${LIBRARY} ${LDLIBS}
+	@echo "  LINK   ${ALLTYPES}_client"
+	${Q}${CC} ${LDFLAGS} -o ${ALLTYPES}_client ${ALLTYPES}_client_skel.o ${ALLTYPES}_clnt.o \
+	    ${ALLTYPES}_xdr.o ${BUILD}/${LIBRARY} ${LDLIBS}
+	@echo "  CC     tests/test_gen.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -Werror -I${TESTDIR}/alltypes ${LDFLAGS} -o ${.TARGET} \
+	    tests/test_gen.c ${ALLTYPES}_xdr.o ${BUILD}/${LIBRARY} ${LDLIBS}
+
+# test_rpc runs a client and a server in one loop, using tests/calc.x.
+${TESTDIR}/calc/.generated: tests/calc.x ${BUILD}/${PROGRAM}
+	@echo "  GEN    tests/calc.x"
+	@mkdir -p ${TESTDIR}/calc
+	${Q}${BUILD}/${PROGRAM} -o ${TESTDIR}/calc tests/calc.x
+	${Q}touch ${.TARGET}
+
+.for part in xdr clnt svc
+${TESTDIR}/calc/calc_${part}.o: ${TESTDIR}/calc/.generated ${DEPEND_HEADERS}
+	@echo "  CC     ${TESTDIR}/calc/calc_${part}.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -c -o ${.TARGET} ${TESTDIR}/calc/calc_${part}.c
+.endfor
+
+${TESTDIR}/test_rpc: tests/test_rpc.c ${TESTDIR}/calc/calc_xdr.o ${TESTDIR}/calc/calc_clnt.o \
+                     ${TESTDIR}/calc/calc_svc.o ${BUILD}/${LIBRARY}
+	@echo "  CC     tests/test_rpc.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -I${TESTDIR}/calc ${LDFLAGS} -o ${.TARGET} tests/test_rpc.c \
+	    ${TESTDIR}/calc/calc_xdr.o ${TESTDIR}/calc/calc_clnt.o ${TESTDIR}/calc/calc_svc.o \
+	    ${BUILD}/${LIBRARY} ${LDLIBS}
+
+# ---------------------------------------------------------------------------
+# Top-level targets
+# ---------------------------------------------------------------------------
+
+all: ${BUILD}/${PROGRAM} ${BUILD}/${LIBRARY} ${EXAMPLE_PROGRAMS}
+	${Q}ln -sf ${BUILD}/${PROGRAM} ${PROGRAM}
+
+debug: ${BUILD}/${PROGRAM} ${BUILD}/${LIBRARY} ${EXAMPLE_PROGRAMS}
+	@echo "Debug build: ${BUILD}"
+
+lib: ${BUILD}/${LIBRARY}
+
+examples: ${EXAMPLE_PROGRAMS}
+
+# The library must never call the C allocator: check what its objects import.
+check-alloc: ${LIB_OBJECTS}
+	${Q}if ${NM} -u ${LIB_OBJECTS} | grep -Ew '_?(malloc|calloc|realloc|free|strdup|strndup|aligned_alloc|posix_memalign)$$'; then \
+	    echo "check-alloc: FAILED - the library references the C allocator"; exit 1; \
+	else echo "check-alloc: the library does not reference malloc/calloc/realloc/free"; fi
+
+check: ${TEST_PROGRAMS} ${EXAMPLE_PROGRAMS} check-alloc
+	${Q}${TESTDIR}/test_xdr
+	${Q}${TESTDIR}/test_xspec
+	${Q}${TESTDIR}/test_gen
+	${Q}${TESTDIR}/test_rpc
+	${Q}sh tests/run_examples.sh ${EXDIR}
+
+install: all
+	install -d ${DESTDIR}${BINDIR} ${DESTDIR}${LIBDIR} ${DESTDIR}${INCLUDEDIR}
+	install -m 755 ${BUILD}/${PROGRAM} ${DESTDIR}${BINDIR}/${PROGRAM}
+	install -m 644 ${BUILD}/${LIBRARY} ${DESTDIR}${LIBDIR}/${LIBRARY}
+	install -m 644 ${HEADERS:S,^,${SRCDIR}/,} ${DESTDIR}${INCLUDEDIR}/
+
+uninstall:
+	rm -f ${DESTDIR}${BINDIR}/${PROGRAM}
+	rm -f ${DESTDIR}${LIBDIR}/${LIBRARY}
+	rm -f ${HEADERS:S,^,${DESTDIR}${INCLUDEDIR}/,}
+	-rmdir ${DESTDIR}${INCLUDEDIR} 2>/dev/null
+
+clean:
+	rm -rf ${BUILDROOT}
+	@if [ -L ${PROGRAM} ]; then rm -f ${PROGRAM}; fi
+	@rmdir build 2>/dev/null || true

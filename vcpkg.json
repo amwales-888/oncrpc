@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "liboncrpc",
+  "version": "2.0.0",
+  "description": "Asynchronous ONC RPC and XDR library on libuv, with a .x code generator",
+  "dependencies": [
+    "libuv"
+  ],
+  "builtin-baseline": "9eec002df1cd109f8f104cd966a763daf9751489"
+}

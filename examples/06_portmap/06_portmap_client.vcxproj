@@ -1,0 +1,124 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  06_portmap_client: examples\06_portmap\client.c, with the code oncrpcgen generates
+  from clock.x (clock_xdr.c and clock_clnt.c, in the intermediate directory).
+  Builds build\x64\<Configuration>\06_portmap_client.exe.
+-->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{6CE38DCE-2BED-5DA4-9216-A13CF3AF77CC}</ProjectGuid>
+    <RootNamespace>06_portmap_client</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+
+  <!-- Install libuv from vcpkg.json (requires "vcpkg integrate install" once; see BUILDING.md). -->
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\obj\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <CompileAs>CompileAsC</CompileAs>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <WarningLevel>Level3</WarningLevel>
+      <ConformanceMode>true</ConformanceMode>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- WIN32_LEAN_AND_MEAN keeps <windows.h> from including the old <winsock.h>,
+           which would clash with the <winsock2.h> that libuv uses. -->
+      <PreprocessorDefinitions>WIN32_LEAN_AND_MEAN;_WIN32_WINNT=0x0A00;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\src;$(IntDir)gen;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <!-- oncrpcgen turns clock.x into C, in the intermediate directory, before compiling. -->
+    <CustomBuild Include="clock.x">
+      <Message>oncrpcgen %(Filename)%(Extension)</Message>
+      <Command>if not exist "$(IntDir)gen" mkdir "$(IntDir)gen"
+"$(OutDir)oncrpcgen.exe" -o "$(IntDir)gen" "%(FullPath)"</Command>
+      <AdditionalInputs>$(OutDir)oncrpcgen.exe</AdditionalInputs>
+      <Outputs>$(IntDir)gen\clock.h;$(IntDir)gen\clock_xdr.c;$(IntDir)gen\clock_clnt.c;$(IntDir)gen\clock_svc.c</Outputs>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="client.c" />
+    <ClCompile Include="$(IntDir)gen\clock_xdr.c" />
+    <ClCompile Include="$(IntDir)gen\clock_clnt.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\liboncrpc.vcxproj">
+      <Project>{1DB51815-EAC5-500F-BDB0-E7643BBA293F}</Project>
+    </ProjectReference>
+    <!-- Built first because it generates code; nothing is linked from it. -->
+    <ProjectReference Include="..\..\oncrpcgen.vcxproj">
+      <Project>{28D90221-4456-5694-971A-F211A8A28A7B}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

@@ -1,0 +1,1342 @@
+/*
+ * xgen.c - C code generator for parsed .x specifications.
+ *
+ * Generated names are derived from the .x identifiers (for a type T,
+ * program P, version number V, procedure X; names lower-cased):
+ *   int  xdr_T(oncRPCXdr *, T *)                 XDR routine
+ *   void xdr_free_T(const oncRPCAllocator *, T *) free decoded data
+ *   oncRPCStat x_V(oncRPCClient *, ..., cb, data) client stub (asynchronous)
+ *   void x_V_svc(..., oncRPCSvcReq *)            server procedure to implement
+ *   int  x_V_reply(oncRPCSvcReq *, ...)          send the procedure's reply
+ *   oncRPCStat p_V_register(srv, ctx)            server registration
+ *   x_V_args                                     argument struct when X takes
+ *                                                more than one argument
+ */
+#include "xspec.h"
+
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+#define ONCRPC_NAMELEN 512
+
+typedef struct gen {
+    const oncRPCAllocator *alloc;
+    char               *out;
+    size_t              outlen;
+    size_t              outcap;
+    const oncRPCXSpec *spec;
+    const char         *base;
+    char              **keys;
+    size_t              nkeys;
+    char               *err;
+    size_t              errlen;
+    int                 failed;
+} gen;
+
+/* Append formatted text to the output buffer. */
+static void P(gen *g, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    if (g->failed)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(g->out + g->outlen, g->outcap - g->outlen, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        g->failed = 1;
+        return;
+    }
+    if ((size_t)n >= g->outcap - g->outlen) {
+        size_t nc = g->outcap * 2;
+        char *nb;
+        while (nc - g->outlen <= (size_t)n)
+            nc *= 2;
+        nb = (char *)oncRPCRealloc(g->alloc, g->out, nc);
+        if (nb == NULL) {
+            g->failed = 1;
+            return;
+        }
+        g->out = nb;
+        g->outcap = nc;
+        va_start(ap, fmt);
+        n = vsnprintf(g->out + g->outlen, g->outcap - g->outlen, fmt, ap);
+        va_end(ap);
+        if (n < 0 || (size_t)n >= g->outcap - g->outlen) {
+            g->failed = 1;
+            return;
+        }
+    }
+    g->outlen += (size_t)n;
+}
+
+static void ind(gen *g, int n)
+{
+    while (n-- > 0)
+        P(g, "    ");
+}
+
+static void gerr(gen *g, const char *fmt, ...)
+{
+    va_list ap;
+    if (g->failed)
+        return;
+    g->failed = 1;
+    if (g->err != NULL && g->errlen > 0) {
+        va_start(ap, fmt);
+        vsnprintf(g->err, g->errlen, fmt, ap);
+        va_end(ap);
+    }
+}
+
+/* snprintf that reports truncation as a generation error. */
+static void sfmt(gen *g, char *buf, size_t n, const char *fmt, ...)
+{
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    r = vsnprintf(buf, n, fmt, ap);
+    va_end(ap);
+    if (r < 0 || (size_t)r >= n)
+        gerr(g, "identifier too long");
+}
+
+static void lower_copy(char *dst, size_t n, const char *src)
+{
+    size_t i;
+    for (i = 0; i + 1 < n && src[i] != '\0'; i++)
+        dst[i] = (char)tolower((unsigned char)src[i]);
+    dst[i] = '\0';
+}
+
+/* ---- Type mapping --------------------------------------------------------- */
+
+static const char *base_ctype(oncRPCXTypeKind k)
+{
+    switch (k) {
+    case ONCRPC_XTYPE_INT:    return "int32_t";
+    case ONCRPC_XTYPE_UINT:   return "uint32_t";
+    case ONCRPC_XTYPE_HYPER:  return "int64_t";
+    case ONCRPC_XTYPE_UHYPER: return "uint64_t";
+    case ONCRPC_XTYPE_FLOAT:  return "float";
+    case ONCRPC_XTYPE_DOUBLE: return "double";
+    case ONCRPC_XTYPE_BOOL:   return "oncRPCBool";
+    case ONCRPC_XTYPE_CHAR:   return "int8_t";
+    case ONCRPC_XTYPE_UCHAR:  return "uint8_t";
+    case ONCRPC_XTYPE_SHORT:  return "int16_t";
+    case ONCRPC_XTYPE_USHORT: return "uint16_t";
+    case ONCRPC_XTYPE_STRING: return "char *";
+    default:                  return "void";
+    }
+}
+
+static const char *base_xfn(oncRPCXTypeKind k)
+{
+    switch (k) {
+    case ONCRPC_XTYPE_INT:    return "oncRPCXdrInt32";
+    case ONCRPC_XTYPE_UINT:   return "oncRPCXdrUint32";
+    case ONCRPC_XTYPE_HYPER:  return "oncRPCXdrInt64";
+    case ONCRPC_XTYPE_UHYPER: return "oncRPCXdrUint64";
+    case ONCRPC_XTYPE_FLOAT:  return "oncRPCXdrFloat";
+    case ONCRPC_XTYPE_DOUBLE: return "oncRPCXdrDouble";
+    case ONCRPC_XTYPE_BOOL:   return "oncRPCXdrBool";
+    case ONCRPC_XTYPE_CHAR:   return "oncRPCXdrInt8";
+    case ONCRPC_XTYPE_UCHAR:  return "oncRPCXdrUint8";
+    case ONCRPC_XTYPE_SHORT:  return "oncRPCXdrInt16";
+    case ONCRPC_XTYPE_USHORT: return "oncRPCXdrUint16";
+    default:                  return "oncRPCXdrVoid";
+    }
+}
+
+static const char *base_key(oncRPCXTypeKind k)
+{
+    switch (k) {
+    case ONCRPC_XTYPE_INT:    return "int";
+    case ONCRPC_XTYPE_UINT:   return "uint";
+    case ONCRPC_XTYPE_HYPER:  return "hyper";
+    case ONCRPC_XTYPE_UHYPER: return "uhyper";
+    case ONCRPC_XTYPE_FLOAT:  return "float";
+    case ONCRPC_XTYPE_DOUBLE: return "double";
+    case ONCRPC_XTYPE_BOOL:   return "bool";
+    case ONCRPC_XTYPE_CHAR:   return "char";
+    case ONCRPC_XTYPE_UCHAR:  return "uchar";
+    case ONCRPC_XTYPE_SHORT:  return "short";
+    case ONCRPC_XTYPE_USHORT: return "ushort";
+    case ONCRPC_XTYPE_STRING: return "string";
+    default:                  return "void";
+    }
+}
+
+static const char *ctype(const oncRPCXType *t)
+{
+    return t->kind == ONCRPC_XTYPE_NAMED ? t->name : base_ctype(t->kind);
+}
+
+/* "T name" (handles "char *name") */
+static void print_var(gen *g, const oncRPCXType *t, const char *name)
+{
+    if (t->kind == ONCRPC_XTYPE_STRING)
+        P(g, "char *%s", name);
+    else
+        P(g, "%s %s", ctype(t), name);
+}
+
+static void print_res_ptr(gen *g, const oncRPCXType *t)
+{
+    if (t->kind == ONCRPC_XTYPE_STRING)
+        P(g, "char **");
+    else
+        P(g, "%s *", ctype(t));
+}
+
+/* Prints the XDR call for type t on pointer expression ptr. */
+static void print_xdr_call(gen *g, const oncRPCXType *t, const char *ptr)
+{
+    if (t->kind == ONCRPC_XTYPE_NAMED)
+        P(g, "xdr_%s(xdrs, %s)", t->name, ptr);
+    else if (t->kind == ONCRPC_XTYPE_STRING)
+        P(g, "oncRPCXdrString(xdrs, %s, ONCRPC_XDR_UNBOUNDED)", ptr);
+    else
+        P(g, "%s(xdrs, %s)", base_xfn(t->kind), ptr);
+}
+
+static void type_key(const oncRPCXType *t, char *buf, size_t n)
+{
+    snprintf(buf, n, "%s", t->kind == ONCRPC_XTYPE_NAMED ? t->name : base_key(t->kind));
+}
+
+static void bound_expr(const oncRPCXDecl *d, char *buf, size_t n)
+{
+    if (d->size != NULL)
+        snprintf(buf, n, "(uint32_t)(%s)", d->size);
+    else
+        snprintf(buf, n, "ONCRPC_XDR_UNBOUNDED");
+}
+
+/* ---- Declarations in headers ------------------------------------------------ */
+
+static void emit_field(gen *g, const oncRPCXDecl *d, int n)
+{
+    const char *ct = ctype(&d->type);
+    switch (d->kind) {
+    case ONCRPC_XDECL_VOID:
+        return;
+    case ONCRPC_XDECL_PLAIN:
+        ind(g, n);
+        P(g, "%s %s;\n", ct, d->name);
+        break;
+    case ONCRPC_XDECL_FIXED_ARRAY:
+        ind(g, n);
+        P(g, "%s %s[%s];\n", ct, d->name, d->size);
+        break;
+    case ONCRPC_XDECL_VAR_ARRAY:
+        ind(g, n);
+        P(g, "struct {\n");
+        ind(g, n + 1);
+        P(g, "uint32_t %s_len;\n", d->name);
+        ind(g, n + 1);
+        P(g, "%s *%s_val;\n", ct, d->name);
+        ind(g, n);
+        P(g, "} %s;\n", d->name);
+        break;
+    case ONCRPC_XDECL_OPAQUE_FIXED:
+        ind(g, n);
+        P(g, "uint8_t %s[%s];\n", d->name, d->size);
+        break;
+    case ONCRPC_XDECL_OPAQUE_VAR:
+        ind(g, n);
+        P(g, "struct {\n");
+        ind(g, n + 1);
+        P(g, "uint32_t %s_len;\n", d->name);
+        ind(g, n + 1);
+        P(g, "uint8_t *%s_val;\n", d->name);
+        ind(g, n);
+        P(g, "} %s;\n", d->name);
+        break;
+    case ONCRPC_XDECL_STRING:
+        ind(g, n);
+        P(g, "char *%s;\n", d->name);
+        break;
+    case ONCRPC_XDECL_OPTIONAL:
+        ind(g, n);
+        P(g, "%s *%s;\n", ct, d->name);
+        break;
+    }
+}
+
+static void emit_typedef(gen *g, const oncRPCXDef *def)
+{
+    const oncRPCXDecl *d = &def->decl;
+    const char *ct = ctype(&d->type), *nm = def->name;
+
+    switch (d->kind) {
+    case ONCRPC_XDECL_PLAIN:
+        P(g, "typedef %s %s;\n", ct, nm);
+        break;
+    case ONCRPC_XDECL_FIXED_ARRAY:
+        P(g, "typedef %s %s[%s];\n", ct, nm, d->size);
+        break;
+    case ONCRPC_XDECL_VAR_ARRAY:
+        P(g, "typedef struct {\n    uint32_t %s_len;\n    %s *%s_val;\n} %s;\n", nm, ct, nm, nm);
+        break;
+    case ONCRPC_XDECL_OPAQUE_FIXED:
+        P(g, "typedef uint8_t %s[%s];\n", nm, d->size);
+        break;
+    case ONCRPC_XDECL_OPAQUE_VAR:
+        P(g, "typedef struct {\n    uint32_t %s_len;\n    uint8_t *%s_val;\n} %s;\n", nm, nm, nm);
+        break;
+    case ONCRPC_XDECL_STRING:
+        P(g, "typedef char *%s;\n", nm);
+        break;
+    case ONCRPC_XDECL_OPTIONAL:
+        P(g, "typedef %s *%s;\n", ct, nm);
+        break;
+    case ONCRPC_XDECL_VOID:
+        break;
+    }
+}
+
+/* ---- XDR routine bodies ------------------------------------------------------ */
+
+/* Emit code that runs the XDR routine for declaration d stored at lvalue lv. */
+static void emit_decl_xdr(gen *g, const oncRPCXDecl *d, const char *lv, int n)
+{
+    char ptr[ONCRPC_NAMELEN * 2], len[ONCRPC_NAMELEN * 2], val[ONCRPC_NAMELEN * 2], bound[ONCRPC_NAMELEN];
+    const char *ct = ctype(&d->type);
+
+    bound_expr(d, bound, sizeof(bound));
+    switch (d->kind) {
+    case ONCRPC_XDECL_VOID:
+        return;
+
+    case ONCRPC_XDECL_PLAIN:
+        sfmt(g, ptr, sizeof(ptr), "&%s", lv);
+        ind(g, n);
+        P(g, "if (!");
+        print_xdr_call(g, &d->type, ptr);
+        P(g, ")\n");
+        ind(g, n + 1);
+        P(g, "return 0;\n");
+        return;
+
+    case ONCRPC_XDECL_FIXED_ARRAY:
+        sfmt(g, ptr, sizeof(ptr), "&%s[i_]", lv);
+        ind(g, n);
+        P(g, "{\n");
+        ind(g, n + 1);
+        P(g, "uint32_t i_;\n");
+        ind(g, n + 1);
+        P(g, "for (i_ = 0; i_ < (uint32_t)(%s); i_++) {\n", d->size);
+        ind(g, n + 2);
+        P(g, "if (!");
+        print_xdr_call(g, &d->type, ptr);
+        P(g, ")\n");
+        ind(g, n + 3);
+        P(g, "return 0;\n");
+        ind(g, n + 1);
+        P(g, "}\n");
+        ind(g, n);
+        P(g, "}\n");
+        return;
+
+    case ONCRPC_XDECL_VAR_ARRAY:
+        sfmt(g, len, sizeof(len), "%s.%s_len", lv, d->name);
+        sfmt(g, val, sizeof(val), "%s.%s_val", lv, d->name);
+        sfmt(g, ptr, sizeof(ptr), "&%s[i_]", val);
+        ind(g, n);     P(g, "{\n");
+        ind(g, n + 1); P(g, "uint32_t i_;\n");
+        ind(g, n + 1); P(g, "if (xdrs->op == ONCRPC_XDR_ENCODE && %s == NULL && %s != 0)\n", val, len);
+        ind(g, n + 2); P(g, "return 0;\n");
+        ind(g, n + 1); P(g, "if (!oncRPCXdrArrayLen(xdrs, &%s, %s))\n", len, bound);
+        ind(g, n + 2); P(g, "return 0;\n");
+        ind(g, n + 1); P(g, "if (xdrs->op == ONCRPC_XDR_DECODE) {\n");
+        ind(g, n + 2); P(g, "%s = NULL;\n", val);
+        ind(g, n + 2); P(g, "if (%s != 0) {\n", len);
+        ind(g, n + 3); P(g, "%s = (%s *)oncRPCXdrArrayAlloc(xdrs, %s, sizeof(%s));\n",
+                         val, ct, len, ct);
+        ind(g, n + 3); P(g, "if (%s == NULL) {\n", val);
+        ind(g, n + 4); P(g, "%s = 0;\n", len);
+        ind(g, n + 4); P(g, "return 0;\n");
+        ind(g, n + 3); P(g, "}\n");
+        ind(g, n + 2); P(g, "}\n");
+        ind(g, n + 1); P(g, "}\n");
+        ind(g, n + 1); P(g, "if (%s != NULL) {\n", val);
+        ind(g, n + 2); P(g, "for (i_ = 0; i_ < %s; i_++) {\n", len);
+        ind(g, n + 3); P(g, "if (!");
+        print_xdr_call(g, &d->type, ptr);
+        P(g, ")\n");
+        ind(g, n + 4); P(g, "return 0;\n");
+        ind(g, n + 2); P(g, "}\n");
+        ind(g, n + 1); P(g, "}\n");
+        ind(g, n + 1); P(g, "if (xdrs->op == ONCRPC_XDR_FREE) {\n");
+        ind(g, n + 2); P(g, "oncRPCXdrMemFree(xdrs, %s);\n", val);
+        ind(g, n + 2); P(g, "%s = NULL;\n", val);
+        ind(g, n + 2); P(g, "%s = 0;\n", len);
+        ind(g, n + 1); P(g, "}\n");
+        ind(g, n);     P(g, "}\n");
+        return;
+
+    case ONCRPC_XDECL_OPAQUE_FIXED:
+        ind(g, n);
+        P(g, "if (!oncRPCXdrOpaque(xdrs, %s, (uint32_t)(%s)))\n", lv, d->size);
+        ind(g, n + 1);
+        P(g, "return 0;\n");
+        return;
+
+    case ONCRPC_XDECL_OPAQUE_VAR:
+        ind(g, n);
+        P(g, "if (!oncRPCXdrBytes(xdrs, &%s.%s_val, &%s.%s_len, %s))\n",
+          lv, d->name, lv, d->name, bound);
+        ind(g, n + 1);
+        P(g, "return 0;\n");
+        return;
+
+    case ONCRPC_XDECL_STRING:
+        ind(g, n);
+        P(g, "if (!oncRPCXdrString(xdrs, &%s, %s))\n", lv, bound);
+        ind(g, n + 1);
+        P(g, "return 0;\n");
+        return;
+
+    case ONCRPC_XDECL_OPTIONAL:
+        ind(g, n);     P(g, "{\n");
+        ind(g, n + 1); P(g, "oncRPCBool more_ = (%s != NULL);\n", lv);
+        ind(g, n + 1); P(g, "if (xdrs->op != ONCRPC_XDR_FREE && !oncRPCXdrBool(xdrs, &more_))\n");
+        ind(g, n + 2); P(g, "return 0;\n");
+        ind(g, n + 1); P(g, "if (xdrs->op == ONCRPC_XDR_DECODE) {\n");
+        ind(g, n + 2); P(g, "%s = NULL;\n", lv);
+        ind(g, n + 2); P(g, "if (more_) {\n");
+        ind(g, n + 3); P(g, "%s = (%s *)oncRPCXdrArrayAlloc(xdrs, 1, sizeof(%s));\n", lv, ct, ct);
+        ind(g, n + 3); P(g, "if (%s == NULL)\n", lv);
+        ind(g, n + 4); P(g, "return 0;\n");
+        ind(g, n + 2); P(g, "}\n");
+        ind(g, n + 1); P(g, "}\n");
+        ind(g, n + 1); P(g, "if (%s != NULL && !", lv);
+        print_xdr_call(g, &d->type, lv);
+        P(g, ")\n");
+        ind(g, n + 2); P(g, "return 0;\n");
+        ind(g, n + 1); P(g, "if (xdrs->op == ONCRPC_XDR_FREE && %s != NULL) {\n", lv);
+        ind(g, n + 2); P(g, "oncRPCXdrMemFree(xdrs, %s);\n", lv);
+        ind(g, n + 2); P(g, "%s = NULL;\n", lv);
+        ind(g, n + 1); P(g, "}\n");
+        ind(g, n);     P(g, "}\n");
+        return;
+    }
+}
+
+/* TRUE and FALSE are the XDR bool constants; C has no such names. */
+static const char *case_label(gen *g, const char *v)
+{
+    if (oncRPCXSpecFind(g->spec, v) == NULL) {
+        if (strcmp(v, "TRUE") == 0)
+            return "1";
+        if (strcmp(v, "FALSE") == 0)
+            return "0";
+    }
+    return v;
+}
+
+static int is_type_def(const oncRPCXDef *d)
+{
+    return d->kind == ONCRPC_XDEF_TYPEDEF || d->kind == ONCRPC_XDEF_ENUM ||
+           d->kind == ONCRPC_XDEF_STRUCT || d->kind == ONCRPC_XDEF_UNION;
+}
+
+static void emit_free_fn(gen *g, const char *name)
+{
+    P(g, "void xdr_free_%s(const oncRPCAllocator *alloc, %s *objp)\n{\n", name, name);
+    P(g, "    oncRPCXdr xdrs_;\n");
+    P(g, "    oncRPCXdrInitFree(&xdrs_, alloc);\n");
+    P(g, "    (void)xdr_%s(&xdrs_, objp);\n}\n\n", name);
+}
+
+static void emit_type_xdr(gen *g, const oncRPCXDef *d)
+{
+    char lv[ONCRPC_NAMELEN * 2];
+    size_t i, j;
+
+    P(g, "int xdr_%s(oncRPCXdr *xdrs, %s *objp)\n{\n", d->name, d->name);
+    switch (d->kind) {
+    case ONCRPC_XDEF_ENUM:
+        P(g, "    int32_t v_ = (int32_t)*objp;\n");
+        P(g, "    if (!oncRPCXdrEnum(xdrs, &v_))\n        return 0;\n");
+        P(g, "    if (xdrs->op == ONCRPC_XDR_DECODE)\n        *objp = (%s)v_;\n", d->name);
+        break;
+    case ONCRPC_XDEF_TYPEDEF:
+        emit_decl_xdr(g, &d->decl, "(*objp)", 1);
+        break;
+    case ONCRPC_XDEF_STRUCT:
+        for (i = 0; i < d->nfields; i++) {
+            sfmt(g, lv, sizeof(lv), "objp->%s", d->fields[i].name);
+            emit_decl_xdr(g, &d->fields[i], lv, 1);
+        }
+        break;
+    case ONCRPC_XDEF_UNION:
+        sfmt(g, lv, sizeof(lv), "objp->%s", d->disc.name);
+        emit_decl_xdr(g, &d->disc, lv, 1);
+        P(g, "    switch (objp->%s) {\n", d->disc.name);
+        for (i = 0; i < d->ncases; i++) {
+            const oncRPCXCase *c = &d->cases[i];
+            for (j = 0; j < c->nvalues; j++)
+                P(g, "    case %s:\n", case_label(g, c->values[j]));
+            if (c->arm.kind != ONCRPC_XDECL_VOID) {
+                sfmt(g, lv, sizeof(lv), "objp->%s_u.%s", d->name, c->arm.name);
+                emit_decl_xdr(g, &c->arm, lv, 2);
+            }
+            P(g, "        break;\n");
+        }
+        P(g, "    default:\n");
+        if (d->defaultArm != NULL) {
+            if (d->defaultArm->kind != ONCRPC_XDECL_VOID) {
+                sfmt(g, lv, sizeof(lv), "objp->%s_u.%s", d->name, d->defaultArm->name);
+                emit_decl_xdr(g, d->defaultArm, lv, 2);
+            }
+            P(g, "        break;\n");
+        } else {
+            P(g, "        return 0;\n");
+        }
+        P(g, "    }\n");
+        break;
+    default:
+        break;
+    }
+    P(g, "    return 1;\n}\n\n");
+    emit_free_fn(g, d->name);
+}
+
+/* ---- Programs --------------------------------------------------------------- */
+
+static int version_number(gen *g, const oncRPCXVersion *v, char *buf, size_t n)
+{
+    int64_t val;
+    if (oncRPCXSpecEval(g->spec, v->number, &val) != 0 || val < 0 || val > 0xffffffffLL) {
+        gerr(g, "cannot evaluate version number '%s' of version '%s'", v->number, v->name);
+        return -1;
+    }
+    sfmt(g, buf, n, "%lld", (long long)val);
+    return 0;
+}
+
+/* lower(name) + "_" + version number */
+static int proc_fn(gen *g, const char *name, const oncRPCXVersion *v, char *buf, size_t n)
+{
+    char vn[32], low[ONCRPC_NAMELEN];
+    if (version_number(g, v, vn, sizeof(vn)) != 0)
+        return -1;
+    lower_copy(low, sizeof(low), name);
+    sfmt(g, buf, n, "%s_%s", low, vn);
+    return 0;
+}
+
+/* Type passed for the procedure's argument(s); 0 for void. */
+static int proc_argtype(const oncRPCXProc *pr, const char *fn, oncRPCXType *t,
+                        char *namebuf, size_t n)
+{
+    if (pr->nargs == 0)
+        return 0;
+    if (pr->nargs == 1) {
+        *t = pr->args[0];
+        return 1;
+    }
+    snprintf(namebuf, n, "%s_args", fn);
+    memset(t, 0, sizeof(*t));
+    t->kind = ONCRPC_XTYPE_NAMED;
+    t->name = namebuf;
+    return 1;
+}
+
+/* "const char *" for strings, "const T *" otherwise: read-only arguments. */
+static void print_arg_param(gen *g, const oncRPCXType *t, const char *name)
+{
+    if (t->kind == ONCRPC_XTYPE_STRING)
+        P(g, "const char *%s", name);
+    else
+        P(g, "const %s *%s", ctype(t), name);
+}
+
+static void print_client_proto(gen *g, const oncRPCXProc *pr, const char *fn)
+{
+    size_t i;
+    char an[16];
+    P(g, "oncRPCStat %s(oncRPCClient *clnt", fn);
+    for (i = 0; i < pr->nargs; i++) {
+        if (pr->nargs == 1)
+            sfmt(g, an, sizeof(an), "arg");
+        else
+            sfmt(g, an, sizeof(an), "arg%u", (unsigned)(i + 1));
+        P(g, ", ");
+        print_arg_param(g, &pr->args[i], an);
+    }
+    if (pr->result.kind != ONCRPC_XTYPE_VOID) {
+        P(g, ", ");
+        print_res_ptr(g, &pr->result);
+        P(g, "res");
+    }
+    P(g, ", oncRPCCallCb cb, void *data)");
+}
+
+static void print_svc_proto(gen *g, const oncRPCXProc *pr, const char *fn)
+{
+    size_t i;
+    char an[16];
+    P(g, "void %s_svc(", fn);
+    for (i = 0; i < pr->nargs; i++) {
+        if (pr->nargs == 1)
+            sfmt(g, an, sizeof(an), "arg");
+        else
+            sfmt(g, an, sizeof(an), "arg%u", (unsigned)(i + 1));
+        print_arg_param(g, &pr->args[i], an);
+        P(g, ", ");
+    }
+    P(g, "oncRPCSvcReq *req)");
+}
+
+static void print_reply_proto(gen *g, const oncRPCXProc *pr, const char *fn)
+{
+    P(g, "int %s_reply(oncRPCSvcReq *req", fn);
+    if (pr->result.kind != ONCRPC_XTYPE_VOID) {
+        P(g, ", ");
+        print_arg_param(g, &pr->result, "res");
+    }
+    P(g, ")");
+}
+
+/* Has an earlier version of the program already defined this proc name? */
+static int proc_seen(const oncRPCXDef *prog, size_t vi, const char *name)
+{
+    size_t i, j;
+    for (i = 0; i < vi; i++)
+        for (j = 0; j < prog->versions[i].nprocs; j++)
+            if (strcmp(prog->versions[i].procs[j].name, name) == 0)
+                return 1;
+    return 0;
+}
+
+static void header_program(gen *g, const oncRPCXDef *d)
+{
+    size_t vi, i, k;
+    char fn[ONCRPC_NAMELEN], pfn[ONCRPC_NAMELEN];
+
+    P(g, "\n/* ---- Program %s ---- */\n\n", d->name);
+    P(g, "#define %s %s\n", d->name, d->value);
+    for (vi = 0; vi < d->nversions; vi++) {
+        const oncRPCXVersion *v = &d->versions[vi];
+        P(g, "#define %s %s\n", v->name, v->number);
+        for (i = 0; i < v->nprocs; i++)
+            if (!proc_seen(d, vi, v->procs[i].name))
+                P(g, "#define %s %s\n", v->procs[i].name, v->procs[i].number);
+    }
+    for (vi = 0; vi < d->nversions && !g->failed; vi++) {
+        const oncRPCXVersion *v = &d->versions[vi];
+
+        P(g, "\n/* Version %s */\n", v->name);
+        for (i = 0; i < v->nprocs; i++) {
+            const oncRPCXProc *pr = &v->procs[i];
+            if (pr->nargs < 2 || proc_fn(g, pr->name, v, fn, sizeof(fn)) != 0)
+                continue;
+            P(g, "\ntypedef struct %s_args {\n", fn);
+            for (k = 0; k < pr->nargs; k++) {
+                char an[16];
+                sfmt(g, an, sizeof(an), "arg%u", (unsigned)(k + 1));
+                P(g, "    ");
+                print_var(g, &pr->args[k], an);
+                P(g, ";\n");
+            }
+            P(g, "} %s_args;\n", fn);
+            P(g, "int xdr_%s_args(oncRPCXdr *xdrs, %s_args *objp);\n", fn, fn);
+            P(g, "void xdr_free_%s_args(const oncRPCAllocator *alloc, %s_args *objp);\n", fn, fn);
+        }
+
+        P(g, "\n/* Client stubs. Each starts a call and returns at once; cb runs when\n"
+             " * it completes. res must stay valid until then; on ONCRPC_OK release\n"
+             " * its contents with the matching xdr_free_* routine (oncRPCFree for a\n"
+             " * string). */\n");
+        for (i = 0; i < v->nprocs; i++) {
+            if (proc_fn(g, v->procs[i].name, v, fn, sizeof(fn)) != 0)
+                return;
+            print_client_proto(g, &v->procs[i], fn);
+            P(g, ";\n");
+        }
+        P(g, "\n/* Server procedures: implement these. Each must finish req exactly\n"
+             " * once - immediately or later - with its *_reply function or an\n"
+             " * oncRPCSvcErr* function (or oncRPCSvcDrop). The arguments stay valid\n"
+             " * until then. */\n");
+        for (i = 0; i < v->nprocs; i++) {
+            if (proc_fn(g, v->procs[i].name, v, fn, sizeof(fn)) != 0)
+                return;
+            print_svc_proto(g, &v->procs[i], fn);
+            P(g, ";\n");
+        }
+        P(g, "\n/* Replies: encode the result (not retained) and finish req. */\n");
+        for (i = 0; i < v->nprocs; i++) {
+            if (proc_fn(g, v->procs[i].name, v, fn, sizeof(fn)) != 0)
+                return;
+            print_reply_proto(g, &v->procs[i], fn);
+            P(g, ";\n");
+        }
+        if (proc_fn(g, d->name, v, pfn, sizeof(pfn)) != 0)
+            return;
+        P(g, "\n/* Serve version %s on srv (see oncRPCServerRegister). */\n", v->name);
+        P(g, "oncRPCStat %s_register(oncRPCServer *srv, void *ctx);\n", pfn);
+    }
+}
+
+static void guard_name(const char *base, char *buf, size_t n)
+{
+    size_t i, j = 0;
+    for (i = 0; base[i] != '\0' && j + 1 < n; i++) {
+        unsigned char c = (unsigned char)base[i];
+        buf[j++] = isalnum(c) ? (char)toupper(c) : '_';
+    }
+    buf[j] = '\0';
+}
+
+/* The input's file name without its directories, so that generated code is
+ * the same on every system and does not record local paths. */
+static const char *source_name(const gen *g)
+{
+    const char *name = g->spec->filename, *p;
+    for (p = name; *p != '\0'; p++)
+        if (*p == '/' || *p == '\\')
+            name = p + 1;
+    return name;
+}
+
+static void file_banner(gen *g, const char *what)
+{
+    P(g, "/*\n * %s\n * Generated by oncrpcgen from %s. Do not edit.\n */\n\n",
+      what, source_name(g));
+}
+
+/* Generated .c files include libuv through oncrpc.h, which on Linux needs
+ * POSIX declarations under strict C99. */
+static void c_prelude(gen *g)
+{
+    P(g, "/* glibc hides the POSIX declarations libuv needs under strict -std=c99. */\n"
+         "#if defined(__linux__) && !defined(_POSIX_C_SOURCE)\n"
+         "#define _POSIX_C_SOURCE 200809L\n"
+         "#endif\n\n");
+}
+
+static void gen_header(gen *g)
+{
+    const oncRPCXDef *d;
+    char guard[ONCRPC_NAMELEN];
+    size_t i;
+
+    guard_name(g->base, guard, sizeof(guard));
+    file_banner(g, "Types, constants and prototypes");
+    P(g, "#ifndef ONCRPC_GEN_%s_H\n#define ONCRPC_GEN_%s_H\n\n", guard, guard);
+    {
+        /* Without programs the code needs only the XDR layer (no libuv). */
+        int has_program = 0;
+        for (d = g->spec->defs; d != NULL; d = d->next)
+            if (d->kind == ONCRPC_XDEF_PROGRAM)
+                has_program = 1;
+        P(g, "#include <stdint.h>\n#include \"%s\"\n\n", has_program ? "oncrpc.h" : "xdr.h");
+    }
+    P(g, "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
+
+    for (d = g->spec->defs; d != NULL; d = d->next)
+        if (d->kind == ONCRPC_XDEF_STRUCT || d->kind == ONCRPC_XDEF_UNION)
+            P(g, "typedef struct %s %s;\n", d->name, d->name);
+    P(g, "\n");
+
+    for (d = g->spec->defs; d != NULL; d = d->next) {
+        switch (d->kind) {
+        case ONCRPC_XDEF_PASSTHROUGH:
+            P(g, "%s\n", d->value);
+            break;
+        case ONCRPC_XDEF_CONST:
+            P(g, "#define %s %s\n", d->name, d->value);
+            break;
+        case ONCRPC_XDEF_ENUM:
+            P(g, "\ntypedef enum %s {\n", d->name);
+            for (i = 0; i < d->nitems; i++) {
+                if (d->items[i].value != NULL)
+                    P(g, "    %s = %s", d->items[i].name, d->items[i].value);
+                else
+                    P(g, "    %s", d->items[i].name);
+                P(g, "%s\n", i + 1 < d->nitems ? "," : "");
+            }
+            P(g, "} %s;\n", d->name);
+            break;
+        case ONCRPC_XDEF_STRUCT:
+            P(g, "\nstruct %s {\n", d->name);
+            for (i = 0; i < d->nfields; i++)
+                emit_field(g, &d->fields[i], 1);
+            P(g, "};\n");
+            break;
+        case ONCRPC_XDEF_UNION: {
+            int any = 0;
+            P(g, "\nstruct %s {\n", d->name);
+            emit_field(g, &d->disc, 1);
+            for (i = 0; i < d->ncases; i++)
+                any |= d->cases[i].arm.kind != ONCRPC_XDECL_VOID;
+            if (d->defaultArm != NULL && d->defaultArm->kind != ONCRPC_XDECL_VOID)
+                any = 1;
+            if (any) {
+                P(g, "    union {\n");
+                for (i = 0; i < d->ncases; i++)
+                    emit_field(g, &d->cases[i].arm, 2);
+                if (d->defaultArm != NULL)
+                    emit_field(g, d->defaultArm, 2);
+                P(g, "    } %s_u;\n", d->name);
+            }
+            P(g, "};\n");
+            break;
+        }
+        case ONCRPC_XDEF_TYPEDEF:
+            P(g, "\n");
+            emit_typedef(g, d);
+            break;
+        default:
+            break;
+        }
+    }
+
+    P(g, "\n/* ---- XDR routines ---- */\n\n");
+    for (d = g->spec->defs; d != NULL; d = d->next) {
+        if (!is_type_def(d))
+            continue;
+        P(g, "int xdr_%s(oncRPCXdr *xdrs, %s *objp);\n", d->name, d->name);
+        P(g, "void xdr_free_%s(const oncRPCAllocator *alloc, %s *objp);\n", d->name, d->name);
+    }
+
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next)
+        if (d->kind == ONCRPC_XDEF_PROGRAM)
+            header_program(g, d);
+
+    P(g, "\n#ifdef __cplusplus\n}\n#endif\n\n#endif /* ONCRPC_GEN_%s_H */\n", guard);
+}
+
+static void gen_xdr(gen *g)
+{
+    const oncRPCXDef *d;
+    size_t vi, i, k;
+    char fn[ONCRPC_NAMELEN], lv[ONCRPC_NAMELEN + 16];
+
+    file_banner(g, "XDR routines");
+    c_prelude(g);
+    P(g, "#include \"%s.h\"\n\n", g->base);
+    for (d = g->spec->defs; d != NULL; d = d->next)
+        if (is_type_def(d))
+            emit_type_xdr(g, d);
+
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next) {
+        if (d->kind != ONCRPC_XDEF_PROGRAM)
+            continue;
+        for (vi = 0; vi < d->nversions; vi++) {
+            const oncRPCXVersion *v = &d->versions[vi];
+            for (i = 0; i < v->nprocs; i++) {
+                const oncRPCXProc *pr = &v->procs[i];
+                if (pr->nargs < 2)
+                    continue;
+                if (proc_fn(g, pr->name, v, fn, sizeof(fn)) != 0)
+                    return;
+                P(g, "int xdr_%s_args(oncRPCXdr *xdrs, %s_args *objp)\n{\n", fn, fn);
+                for (k = 0; k < pr->nargs; k++) {
+                    sfmt(g, lv, sizeof(lv), "&objp->arg%u", (unsigned)(k + 1));
+                    P(g, "    if (!");
+                    print_xdr_call(g, &pr->args[k], lv);
+                    P(g, ")\n        return 0;\n");
+                }
+                P(g, "    return 1;\n}\n\n");
+                sfmt(g, lv, sizeof(lv), "%s_args", fn);
+                emit_free_fn(g, lv);
+            }
+        }
+    }
+}
+
+/* ---- Generic-routine adapters for client and server files ------------------------ */
+
+static int have_key(gen *g, const char *key)
+{
+    size_t i;
+    for (i = 0; i < g->nkeys; i++)
+        if (strcmp(g->keys[i], key) == 0)
+            return 1;
+    return 0;
+}
+
+static void emit_adapter(gen *g, const oncRPCXType *t)
+{
+    char key[ONCRPC_NAMELEN], ptr[ONCRPC_NAMELEN + 16];
+    char **nk;
+
+    type_key(t, key, sizeof(key));
+    if (g->failed || have_key(g, key))
+        return;
+    nk = (char **)oncRPCRealloc(g->alloc, g->keys, (g->nkeys + 1) * sizeof(*nk));
+    if (nk == NULL) {
+        gerr(g, "out of memory");
+        return;
+    }
+    g->keys = nk;
+    g->keys[g->nkeys] = oncRPCStrdup(g->alloc, key);
+    if (g->keys[g->nkeys] == NULL) {
+        gerr(g, "out of memory");
+        return;
+    }
+    g->nkeys++;
+
+    if (t->kind == ONCRPC_XTYPE_STRING)
+        sfmt(g, ptr, sizeof(ptr), "(char **)p");
+    else
+        sfmt(g, ptr, sizeof(ptr), "(%s *)p", ctype(t));
+    P(g, "static int oncrpcgen_xdr_%s(oncRPCXdr *xdrs, void *p)\n{\n    return ", key);
+    print_xdr_call(g, t, ptr);
+    P(g, ";\n}\n\n");
+}
+
+static void emit_adapters(gen *g)
+{
+    const oncRPCXDef *d;
+    size_t vi, i;
+    char fn[ONCRPC_NAMELEN], an[ONCRPC_NAMELEN + 8];
+    oncRPCXType at;
+
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next) {
+        if (d->kind != ONCRPC_XDEF_PROGRAM)
+            continue;
+        for (vi = 0; vi < d->nversions; vi++) {
+            const oncRPCXVersion *v = &d->versions[vi];
+            for (i = 0; i < v->nprocs; i++) {
+                const oncRPCXProc *pr = &v->procs[i];
+                if (proc_fn(g, pr->name, v, fn, sizeof(fn)) != 0)
+                    return;
+                if (proc_argtype(pr, fn, &at, an, sizeof(an)))
+                    emit_adapter(g, &at);
+                if (pr->result.kind != ONCRPC_XTYPE_VOID)
+                    emit_adapter(g, &pr->result);
+            }
+        }
+    }
+}
+
+static void gen_client(gen *g)
+{
+    const oncRPCXDef *d;
+    size_t vi, i, k;
+    char fn[ONCRPC_NAMELEN], an[ONCRPC_NAMELEN + 8], akey[ONCRPC_NAMELEN], rkey[ONCRPC_NAMELEN];
+    oncRPCXType at;
+
+    file_banner(g, "Client stubs");
+    c_prelude(g);
+    P(g, "#include <string.h>\n\n#include \"%s.h\"\n\n", g->base);
+    emit_adapters(g);
+
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next) {
+        if (d->kind != ONCRPC_XDEF_PROGRAM)
+            continue;
+        for (vi = 0; vi < d->nversions; vi++) {
+            const oncRPCXVersion *v = &d->versions[vi];
+            for (i = 0; i < v->nprocs; i++) {
+                const oncRPCXProc *pr = &v->procs[i];
+                int has_arg, has_res = pr->result.kind != ONCRPC_XTYPE_VOID;
+
+                if (proc_fn(g, pr->name, v, fn, sizeof(fn)) != 0)
+                    return;
+                has_arg = proc_argtype(pr, fn, &at, an, sizeof(an));
+                if (has_arg)
+                    type_key(&at, akey, sizeof(akey));
+                if (has_res)
+                    type_key(&pr->result, rkey, sizeof(rkey));
+
+                print_client_proto(g, pr, fn);
+                P(g, "\n{\n");
+                if (pr->nargs > 1) {
+                    P(g, "    %s_args args_;\n", fn);
+                    for (k = 0; k < pr->nargs; k++) {
+                        unsigned n = (unsigned)(k + 1);
+                        if (pr->args[k].kind == ONCRPC_XTYPE_STRING)
+                            P(g, "    args_.arg%u = (char *)arg%u;\n", n, n);
+                        else
+                            P(g, "    memcpy(&args_.arg%u, arg%u, sizeof(args_.arg%u));\n", n, n, n);
+                    }
+                } else if (pr->nargs == 1 && pr->args[0].kind == ONCRPC_XTYPE_STRING) {
+                    P(g, "    char *arg_ = (char *)arg;   /* encoded before returning */\n");
+                }
+                if (has_res)
+                    P(g, "    memset(res, 0, sizeof(*res));\n");
+                P(g, "    return oncRPCClientCall(clnt, %s, ", pr->name);
+                if (!has_arg)
+                    P(g, "NULL, NULL, ");
+                else if (pr->nargs > 1)
+                    P(g, "oncrpcgen_xdr_%s, &args_, ", akey);
+                else if (pr->args[0].kind == ONCRPC_XTYPE_STRING)
+                    P(g, "oncrpcgen_xdr_%s, &arg_, ", akey);
+                else
+                    P(g, "oncrpcgen_xdr_%s, arg, ", akey);
+                if (has_res)
+                    P(g, "oncrpcgen_xdr_%s, res, cb, data);\n}\n\n", rkey);
+                else
+                    P(g, "NULL, NULL, cb, data);\n}\n\n");
+            }
+        }
+    }
+}
+
+static void emit_dispatch_case(gen *g, const oncRPCXProc *pr, const char *fn)
+{
+    oncRPCXType at;
+    char an[ONCRPC_NAMELEN + 8], akey[ONCRPC_NAMELEN];
+    int has_arg = proc_argtype(pr, fn, &at, an, sizeof(an));
+    size_t k;
+
+    P(g, "    case %s: {\n", pr->name);
+    if (has_arg) {
+        type_key(&at, akey, sizeof(akey));
+        if (at.kind == ONCRPC_XTYPE_STRING)
+            P(g, "        char **arg = (char **)oncRPCSvcDecodeArgs(req, oncrpcgen_xdr_%s, "
+                 "sizeof(char *));\n", akey);
+        else
+            P(g, "        %s *arg = (%s *)oncRPCSvcDecodeArgs(req, oncrpcgen_xdr_%s, sizeof(%s));\n",
+              ctype(&at), ctype(&at), akey, ctype(&at));
+        P(g, "        if (arg == NULL) {\n            oncRPCSvcErrDecode(req);\n"
+             "            return;\n        }\n");
+    }
+    P(g, "        %s_svc(", fn);
+    if (pr->nargs == 1) {
+        if (pr->args[0].kind == ONCRPC_XTYPE_STRING)
+            P(g, "*arg, ");
+        else
+            P(g, "(const %s *)arg, ", ctype(&pr->args[0]));
+    } else {
+        for (k = 0; k < pr->nargs; k++) {
+            if (pr->args[k].kind == ONCRPC_XTYPE_STRING)
+                P(g, "arg->arg%u, ", (unsigned)(k + 1));
+            else
+                P(g, "(const %s *)&arg->arg%u, ", ctype(&pr->args[k]), (unsigned)(k + 1));
+        }
+    }
+    P(g, "req);\n        return;\n    }\n");
+}
+
+static void gen_server(gen *g)
+{
+    const oncRPCXDef *d;
+    size_t vi, i;
+    char fn[ONCRPC_NAMELEN], pfn[ONCRPC_NAMELEN], rkey[ONCRPC_NAMELEN];
+
+    file_banner(g, "Server dispatch, replies and registration");
+    c_prelude(g);
+    P(g, "#include <string.h>\n\n#include \"%s.h\"\n\n", g->base);
+    emit_adapters(g);
+
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next) {
+        if (d->kind != ONCRPC_XDEF_PROGRAM)
+            continue;
+        for (vi = 0; vi < d->nversions; vi++) {
+            const oncRPCXVersion *v = &d->versions[vi];
+            int has_null = 0;
+
+            if (proc_fn(g, d->name, v, pfn, sizeof(pfn)) != 0)
+                return;
+            for (i = 0; i < v->nprocs; i++) {
+                const oncRPCXProc *pr = &v->procs[i];
+                if (proc_fn(g, pr->name, v, fn, sizeof(fn)) != 0)
+                    return;
+                print_reply_proto(g, pr, fn);
+                P(g, "\n{\n");
+                if (pr->result.kind == ONCRPC_XTYPE_VOID) {
+                    P(g, "    return oncRPCSvcReply(req, NULL, NULL);\n}\n\n");
+                } else if (pr->result.kind == ONCRPC_XTYPE_STRING) {
+                    type_key(&pr->result, rkey, sizeof(rkey));
+                    P(g, "    char *res_ = (char *)res;   /* encoded, not retained */\n");
+                    P(g, "    return oncRPCSvcReply(req, oncrpcgen_xdr_%s, &res_);\n}\n\n", rkey);
+                } else {
+                    type_key(&pr->result, rkey, sizeof(rkey));
+                    P(g, "    return oncRPCSvcReply(req, oncrpcgen_xdr_%s, res);\n}\n\n", rkey);
+                }
+            }
+            for (i = 0; i < v->nprocs; i++) {
+                int64_t num;
+                if (oncRPCXSpecEval(g->spec, v->procs[i].number, &num) == 0 && num == 0)
+                    has_null = 1;
+            }
+            P(g, "static void %s_dispatch(oncRPCSvcReq *req)\n{\n", pfn);
+            P(g, "    switch (req->proc) {\n");
+            if (!has_null) {
+                P(g, "    case 0:\n");
+                P(g, "        (void)oncRPCSvcReply(req, NULL, NULL);\n");
+                P(g, "        return;\n");
+            }
+            for (i = 0; i < v->nprocs; i++) {
+                if (proc_fn(g, v->procs[i].name, v, fn, sizeof(fn)) != 0)
+                    return;
+                emit_dispatch_case(g, &v->procs[i], fn);
+            }
+            P(g, "    default:\n        oncRPCSvcErrNoProc(req);\n        return;\n    }\n}\n\n");
+            P(g, "oncRPCStat %s_register(oncRPCServer *srv, void *ctx)\n{\n", pfn);
+            P(g, "    return oncRPCServerRegister(srv, %s, %s, %s_dispatch, ctx);\n}\n\n",
+              d->name, v->name, pfn);
+        }
+    }
+}
+
+/* ---- Skeletons --------------------------------------------------------------- */
+
+static void skel_allocator(gen *g)
+{
+    P(g, "/* liboncrpc takes all memory from an application allocator. */\n");
+    P(g, "static void *app_realloc(void *ctx, void *ptr, size_t size)\n{\n"
+         "    (void)ctx;\n    return realloc(ptr, size);\n}\n\n");
+    P(g, "static void app_free(void *ctx, void *ptr)\n{\n    (void)ctx;\n    free(ptr);\n}\n\n");
+    P(g, "static const oncRPCAllocator app_alloc = { app_realloc, app_free, NULL };\n\n");
+}
+
+static void gen_server_skeleton(gen *g)
+{
+    const oncRPCXDef *d;
+    size_t vi, i, k;
+    char fn[ONCRPC_NAMELEN], pfn[ONCRPC_NAMELEN];
+
+    file_banner(g, "Server implementation template");
+    c_prelude(g);
+    P(g, "#include <signal.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n");
+    P(g, "#include \"%s.h\"\n\n", g->base);
+    skel_allocator(g);
+
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next) {
+        if (d->kind != ONCRPC_XDEF_PROGRAM)
+            continue;
+        for (vi = 0; vi < d->nversions; vi++) {
+            const oncRPCXVersion *v = &d->versions[vi];
+            for (i = 0; i < v->nprocs; i++) {
+                const oncRPCXProc *pr = &v->procs[i];
+                if (proc_fn(g, pr->name, v, fn, sizeof(fn)) != 0)
+                    return;
+                print_svc_proto(g, pr, fn);
+                P(g, "\n{\n");
+                if (pr->result.kind != ONCRPC_XTYPE_VOID && pr->result.kind != ONCRPC_XTYPE_STRING) {
+                    P(g, "    ");
+                    print_var(g, &pr->result, "res");
+                    P(g, ";\n\n    memset(&res, 0, sizeof(res));\n");
+                }
+                if (pr->nargs == 1)
+                    P(g, "    (void)arg;\n");
+                for (k = 0; pr->nargs > 1 && k < pr->nargs; k++)
+                    P(g, "    (void)arg%u;\n", (unsigned)(k + 1));
+                P(g, "    /* TODO: implement %s. To answer later, keep req and call\n"
+                     "     * %s_reply() when the result is ready. */\n", pr->name, fn);
+                if (pr->result.kind == ONCRPC_XTYPE_VOID)
+                    P(g, "    (void)%s_reply(req);\n}\n\n", fn);
+                else if (pr->result.kind == ONCRPC_XTYPE_STRING)
+                    P(g, "    (void)%s_reply(req, \"\");\n}\n\n", fn);
+                else
+                    P(g, "    (void)%s_reply(req, (const %s *)&res);\n}\n\n", fn, ctype(&pr->result));
+            }
+        }
+    }
+
+    P(g, "static oncRPCServer *g_server;\nstatic uv_signal_t g_sigint;\n\n");
+    P(g, "static void on_pmap(oncRPCServer *srv, oncRPCStat st, void *data)\n{\n"
+         "    (void)srv;\n"
+         "    if (st != ONCRPC_OK)\n"
+         "        fprintf(stderr, \"port mapper registration of %%s failed: %%s\\n\",\n"
+         "                (const char *)data, oncRPCStrError(st));\n}\n\n");
+    P(g, "static void on_sigint(uv_signal_t *h, int signum)\n{\n"
+         "    (void)signum;\n"
+         "    uv_close((uv_handle_t *)h, NULL);\n"
+         "    /* Registered with the port mapper? Use oncRPCServerPmapUnregister first. */\n"
+         "    oncRPCServerClose(g_server, NULL, NULL);\n}\n\n");
+    P(g, "int main(int argc, char **argv)\n{\n");
+    P(g, "    uv_loop_t *loop = uv_default_loop();\n");
+    P(g, "    uint16_t port = (argc > 1) ? (uint16_t)atoi(argv[1]) : 0;\n\n");
+    P(g, "    if (oncRPCServerCreate(loop, &app_alloc, &g_server) != ONCRPC_OK ||\n");
+    P(g, "        oncRPCServerListen(g_server, ONCRPC_PROTO_TCP, NULL, port) != ONCRPC_OK ||\n");
+    P(g, "        oncRPCServerListen(g_server, ONCRPC_PROTO_UDP, NULL, port) != ONCRPC_OK) {\n");
+    P(g, "        fprintf(stderr, \"cannot create server\\n\");\n        return 1;\n    }\n");
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next) {
+        if (d->kind != ONCRPC_XDEF_PROGRAM)
+            continue;
+        for (vi = 0; vi < d->nversions; vi++) {
+            if (proc_fn(g, d->name, &d->versions[vi], pfn, sizeof(pfn)) != 0)
+                return;
+            P(g, "    (void)%s_register(g_server, NULL);\n", pfn);
+            P(g, "    if (port == 0)\n");
+            P(g, "        (void)oncRPCServerPmapRegister(g_server, %s, %s, on_pmap, \"%s\");\n",
+              d->name, d->versions[vi].name, d->versions[vi].name);
+        }
+    }
+    P(g, "    printf(\"listening on tcp/%%u udp/%%u\\n\",\n");
+    P(g, "           (unsigned)oncRPCServerPort(g_server, ONCRPC_PROTO_TCP),\n");
+    P(g, "           (unsigned)oncRPCServerPort(g_server, ONCRPC_PROTO_UDP));\n");
+    P(g, "    uv_signal_init(loop, &g_sigint);\n");
+    P(g, "    uv_signal_start(&g_sigint, on_sigint, SIGINT);\n");
+    P(g, "    uv_run(loop, UV_RUN_DEFAULT);\n");
+    P(g, "    (void)uv_loop_close(loop);\n    return 0;\n}\n");
+}
+
+static void gen_client_skeleton(gen *g)
+{
+    const oncRPCXDef *d;
+    size_t vi, i, k;
+    char fn[ONCRPC_NAMELEN], an[ONCRPC_NAMELEN + 8];
+    oncRPCXType at;
+
+    file_banner(g, "Example client");
+    c_prelude(g);
+    P(g, "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n");
+    P(g, "#include \"%s.h\"\n\n", g->base);
+    skel_allocator(g);
+    P(g, "static void on_closed(void *data)\n{\n    (void)data;\n}\n\n");
+    P(g, "/* Each client counts its outstanding calls; it closes after the last. */\n");
+    P(g, "static void call_done(oncRPCClient *clnt)\n{\n"
+         "    int *pending = (int *)oncRPCClientData(clnt);\n"
+         "    if (--*pending == 0)\n"
+         "        oncRPCClientClose(clnt, on_closed, NULL);\n}\n\n");
+
+    /* Result storage and a callback per procedure. */
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next) {
+        if (d->kind != ONCRPC_XDEF_PROGRAM)
+            continue;
+        for (vi = 0; vi < d->nversions; vi++) {
+            const oncRPCXVersion *v = &d->versions[vi];
+            for (i = 0; i < v->nprocs; i++) {
+                const oncRPCXProc *pr = &v->procs[i];
+                char rv[ONCRPC_NAMELEN + 8];
+                if (proc_fn(g, pr->name, v, fn, sizeof(fn)) != 0)
+                    return;
+                if (pr->result.kind != ONCRPC_XTYPE_VOID) {
+                    sfmt(g, rv, sizeof(rv), "res_%s", fn);
+                    P(g, "static ");
+                    print_var(g, &pr->result, rv);
+                    P(g, ";\n");
+                }
+                P(g, "static void on_%s(oncRPCClient *clnt, oncRPCStat st, void *res, void *data)\n{\n",
+                  fn);
+                P(g, "    (void)data;\n");
+                P(g, "    printf(\"%s: %%s\\n\", oncRPCStrError(st));\n", pr->name);
+                if (pr->result.kind == ONCRPC_XTYPE_NAMED)
+                    P(g, "    if (st == ONCRPC_OK)\n        xdr_free_%s(oncRPCClientAllocator(clnt), "
+                         "(%s *)res);\n", pr->result.name, pr->result.name);
+                else if (pr->result.kind == ONCRPC_XTYPE_STRING)
+                    P(g, "    if (st == ONCRPC_OK)\n        oncRPCFree(oncRPCClientAllocator(clnt), "
+                         "*(char **)res);\n");
+                else
+                    P(g, "    (void)res;\n");
+                P(g, "    call_done(clnt);\n}\n\n");
+            }
+        }
+    }
+
+    P(g, "int main(int argc, char **argv)\n{\n");
+    P(g, "    uv_loop_t *loop = uv_default_loop();\n");
+    P(g, "    const char *host = (argc > 1) ? argv[1] : \"localhost\";\n");
+    P(g, "    uint16_t port = (argc > 2) ? (uint16_t)atoi(argv[2]) : 0;\n");
+    P(g, "    oncRPCClient *clnt;\n    oncRPCStat st;\n");
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next) {
+        if (d->kind != ONCRPC_XDEF_PROGRAM)
+            continue;
+        for (vi = 0; vi < d->nversions; vi++)
+            P(g, "    static int pending_%s_%u;\n", d->name, (unsigned)vi);
+    }
+    for (d = g->spec->defs; d != NULL && !g->failed; d = d->next) {
+        if (d->kind != ONCRPC_XDEF_PROGRAM)
+            continue;
+        for (vi = 0; vi < d->nversions; vi++) {
+            const oncRPCXVersion *v = &d->versions[vi];
+            P(g, "\n    /* %s version %s */\n", d->name, v->name);
+            P(g, "    st = oncRPCClientCreate(loop, &app_alloc, host, port, %s, %s, ONCRPC_PROTO_TCP,\n"
+                 "                            NULL, &pending_%s_%u, &clnt);\n",
+              d->name, v->name, d->name, (unsigned)vi);
+            P(g, "    if (st != ONCRPC_OK) {\n");
+            P(g, "        fprintf(stderr, \"%%s: %%s\\n\", host, oncRPCStrError(st));\n");
+            P(g, "        return 1;\n    }\n");
+            for (i = 0; i < v->nprocs; i++) {
+                const oncRPCXProc *pr = &v->procs[i];
+                if (proc_fn(g, pr->name, v, fn, sizeof(fn)) != 0)
+                    return;
+                (void)proc_argtype(pr, fn, &at, an, sizeof(an));
+                P(g, "    {\n");
+                for (k = 0; k < pr->nargs; k++) {
+                    char nm[16];
+                    sfmt(g, nm, sizeof(nm), "arg%u", (unsigned)(k + 1));
+                    if (pr->args[k].kind == ONCRPC_XTYPE_STRING) {
+                        P(g, "        const char *%s = \"\";\n", nm);
+                    } else {
+                        P(g, "        ");
+                        print_var(g, &pr->args[k], nm);
+                        P(g, ";\n");
+                    }
+                }
+                for (k = 0; k < pr->nargs; k++)
+                    if (pr->args[k].kind != ONCRPC_XTYPE_STRING)
+                        P(g, "        memset(&arg%u, 0, sizeof(arg%u));\n",
+                          (unsigned)(k + 1), (unsigned)(k + 1));
+                P(g, "        if (%s(clnt", fn);
+                for (k = 0; k < pr->nargs; k++) {
+                    if (pr->args[k].kind == ONCRPC_XTYPE_STRING)
+                        P(g, ", arg%u", (unsigned)(k + 1));
+                    else
+                        P(g, ", (const %s *)&arg%u", ctype(&pr->args[k]), (unsigned)(k + 1));
+                }
+                if (pr->result.kind != ONCRPC_XTYPE_VOID)
+                    P(g, ", &res_%s", fn);
+                P(g, ", on_%s, NULL) == ONCRPC_OK)\n", fn);
+                P(g, "            pending_%s_%u++;\n    }\n", d->name, (unsigned)vi);
+            }
+            P(g, "    if (pending_%s_%u == 0)\n        oncRPCClientClose(clnt, on_closed, NULL);\n",
+              d->name, (unsigned)vi);
+        }
+    }
+    P(g, "\n    uv_run(loop, UV_RUN_DEFAULT);\n    (void)uv_loop_close(loop);\n    return 0;\n}\n");
+}
+
+int oncRPCXSpecGenerate(const oncRPCXSpec *spec, oncRPCXGenKind kind, const char *basename,
+                        char **out, size_t *outlen, char *err, size_t errlen)
+{
+    gen g;
+    size_t i;
+
+    if (err != NULL && errlen > 0)
+        err[0] = '\0';
+    if (out != NULL)
+        *out = NULL;
+    if (outlen != NULL)
+        *outlen = 0;
+    if (spec == NULL || basename == NULL || out == NULL)
+        return -1;
+    memset(&g, 0, sizeof(g));
+    g.alloc = spec->alloc;
+    g.spec = spec;
+    g.base = basename;
+    g.err = err;
+    g.errlen = errlen;
+    g.outcap = 16384;
+    g.out = (char *)oncRPCRealloc(g.alloc, NULL, g.outcap);
+    if (g.out == NULL) {
+        gerr(&g, "out of memory");
+        return -1;
+    }
+    g.out[0] = '\0';
+
+    switch (kind) {
+    case ONCRPC_GEN_HEADER:          gen_header(&g); break;
+    case ONCRPC_GEN_XDR:             gen_xdr(&g); break;
+    case ONCRPC_GEN_CLIENT:          gen_client(&g); break;
+    case ONCRPC_GEN_SERVER:          gen_server(&g); break;
+    case ONCRPC_GEN_SERVER_SKELETON: gen_server_skeleton(&g); break;
+    case ONCRPC_GEN_CLIENT_SKELETON: gen_client_skeleton(&g); break;
+    default:                         gerr(&g, "unknown output kind"); break;
+    }
+    for (i = 0; i < g.nkeys; i++)
+        oncRPCFree(g.alloc, g.keys[i]);
+    oncRPCFree(g.alloc, g.keys);
+    if (g.failed) {
+        if (err != NULL && errlen > 0 && err[0] == '\0')
+            snprintf(err, errlen, "out of memory");
+        oncRPCFree(g.alloc, g.out);
+        return -1;
+    }
+    *out = g.out;
+    if (outlen != NULL)
+        *outlen = g.outlen;
+    return 0;
+}

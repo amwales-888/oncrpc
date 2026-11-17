@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{52F7E1A1-E1A3-5D51-B12E-A1ACBC17BD73}</UniqueIdentifier>
+      <Extensions>c</Extensions>
+    </Filter>
+    <Filter Include="Generated Files">
+      <UniqueIdentifier>{EC2AEEB8-C79F-5377-B72D-116651B9867C}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Interface Files">
+      <UniqueIdentifier>{B920D2C2-55A8-55BD-B1A7-E1620523835E}</UniqueIdentifier>
+      <Extensions>x</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="server.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="$(IntDir)gen\clock_xdr.c">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)gen\clock_svc.c">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="clock.x">
+      <Filter>Interface Files</Filter>
+    </CustomBuild>
+  </ItemGroup>
+</Project>

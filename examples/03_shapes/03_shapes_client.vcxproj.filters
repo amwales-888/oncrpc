@@ -1,0 +1,34 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{E122D161-29F5-57C6-BFC5-8347F40FC826}</UniqueIdentifier>
+      <Extensions>c</Extensions>
+    </Filter>
+    <Filter Include="Generated Files">
+      <UniqueIdentifier>{9D27C4B9-302D-5806-A243-5E22CFFE9F96}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Interface Files">
+      <UniqueIdentifier>{005D7016-0DC5-50A8-B350-9F065B5595B4}</UniqueIdentifier>
+      <Extensions>x</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="client.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="$(IntDir)gen\shapes_xdr.c">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+    <ClCompile Include="$(IntDir)gen\shapes_clnt.c">
+      <Filter>Generated Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="shapes.x">
+      <Filter>Interface Files</Filter>
+    </CustomBuild>
+  </ItemGroup>
+</Project>

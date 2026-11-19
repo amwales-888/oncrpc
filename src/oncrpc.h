@@ -34,7 +34,7 @@
 extern "C" {
 #endif
 
-#define ONCRPC_VERSION_STRING     "3.0.0"
+#define ONCRPC_VERSION_STRING     "3.1.0"
 #define ONCRPC_PROTOCOL_VERSION   2u          /* RPC message protocol version */
 #define ONCRPC_MAX_AUTH_BYTES     400u        /* opaque_auth body limit */
 #define ONCRPC_MAX_MACHINENAME    255u
@@ -53,7 +53,7 @@ extern "C" {
 #define ONCRPC_DEFAULT_DRC_TTL_MS           120000u
 #define ONCRPC_UDP_MAX            65536u
 
-/* Port mapper (RFC 1833, version 2) */
+/* Port mapper (RFC 1833, version 2). rpcbind is its successor; see below. */
 #define ONCRPC_PMAP_PROG          100000u
 #define ONCRPC_PMAP_VERS          2u
 #define ONCRPC_PMAP_PORT          111u
@@ -61,6 +61,22 @@ extern "C" {
 #define ONCRPC_PMAPPROC_SET       1u
 #define ONCRPC_PMAPPROC_UNSET     2u
 #define ONCRPC_PMAPPROC_GETPORT   3u
+
+/* rpcbind (RFC 1833, versions 3 and 4): same program and port. */
+#define ONCRPC_RPCB_PROG          100000u
+#define ONCRPC_RPCB_VERS          3u
+#define ONCRPC_RPCB_VERS4         4u
+#define ONCRPC_RPCBPROC_SET       1u
+#define ONCRPC_RPCBPROC_UNSET     2u
+#define ONCRPC_RPCBPROC_GETADDR   3u
+
+/* Network ids rpcbind uses for TCP and UDP over IPv4 and IPv6. */
+#define ONCRPC_NETID_TCP          "tcp"
+#define ONCRPC_NETID_UDP          "udp"
+#define ONCRPC_NETID_TCP6         "tcp6"
+#define ONCRPC_NETID_UDP6         "udp6"
+/* Room for any universal address, with its terminating NUL. */
+#define ONCRPC_UADDR_MAX          64u
 
 /* Transport protocols (values are the IP protocol numbers). */
 typedef enum oncRPCProto {
@@ -163,7 +179,11 @@ typedef void (*oncRPCCallCb)(oncRPCClient *clnt, oncRPCStat status, void *res, v
 
 /*
  * Create a client for program prog, version vers on host (name or numeric
- * address). If port is 0 the port is looked up with the host's port mapper.
+ * address). If port is 0 the port is looked up with the host's rpcbind:
+ * GETADDR in version 4 or 3, asked over the same transport (TCP or UDP) and
+ * address family the client will use, or the port mapper's GETPORT
+ * (version 2) if the daemon speaks nothing newer. Only the port is taken
+ * from the answer.
  * Resolution, port lookup and connection happen asynchronously; readyCb
  * (may be NULL) reports the outcome. Calls may be issued immediately: they
  * are queued until the client is ready. data is passed to readyCb and is
@@ -217,7 +237,9 @@ ONCRPC_API size_t oncRPCClientPending(const oncRPCClient *clnt);
 
 /* ---- Port mapper --------------------------------------------------------- */
 
-/* value: the port (GetPort) or the port mapper's boolean answer (Set/Unset). */
+/* value: the port (GetPort) or the port mapper's boolean answer (Set/Unset).
+ * The oncRPCPmap* functions speak version 2 only, which knows IPv4 TCP and
+ * UDP; the oncRPCRpcb* functions below speak versions 4 and 3. */
 typedef void (*oncRPCPmapCb)(oncRPCStat status, uint32_t value, void *data);
 
 ONCRPC_API oncRPCStat oncRPCPmapGetPort(uv_loop_t *loop, const oncRPCAllocator *alloc,
@@ -230,6 +252,50 @@ ONCRPC_API oncRPCStat oncRPCPmapSet(uv_loop_t *loop, const oncRPCAllocator *allo
 ONCRPC_API oncRPCStat oncRPCPmapUnset(uv_loop_t *loop, const oncRPCAllocator *alloc,
                                       uint32_t prog, uint32_t vers,
                                       oncRPCPmapCb cb, void *data);
+
+/* ---- rpcbind --------------------------------------------------------------- */
+
+/*
+ * rpcbind versions 3 and 4 describe a service by a network id ("tcp",
+ * "udp", "tcp6", "udp6") and a universal address: the IP address as text
+ * followed by the port's two bytes, high first, so "192.0.2.7.4.1" and
+ * "::1.4.1" both mean port 4 * 256 + 1 = 1025. Unlike version 2 they can
+ * describe IPv6 services.
+ *
+ * These functions ask in version 4 and fall back to version 3 when the
+ * daemon does not speak 4. (oncRPCServerPmapRegister and clients created
+ * with port 0 also fall back to version 2.)
+ */
+
+/* uaddr: the service's universal address (valid during the callback), or
+ * NULL on failure; ONCRPC_ERR_PROGNOTREGISTERED if rpcbind knows none.
+ *
+ * rpcbind answers GETADDR for the transport the question arrives on, not
+ * for the netid in it: oncRPCRpcbGetAddr asks over TCP for "tcp"/"tcp6" and
+ * over UDP for "udp"/"udp6", and over IPv4 or IPv6 as host resolves (IPv4
+ * preferred). To find a tcp6 service, give an IPv6 host such as "::1". */
+typedef void (*oncRPCRpcbAddrCb)(oncRPCStat status, const char *uaddr, void *data);
+
+ONCRPC_API oncRPCStat oncRPCRpcbGetAddr(uv_loop_t *loop, const oncRPCAllocator *alloc,
+                                        const char *host, uint32_t prog, uint32_t vers,
+                                        const char *netid, oncRPCRpcbAddrCb cb, void *data);
+/* Register or unregister with rpcbind on the local host; value in the
+ * callback is rpcbind's boolean answer. netid NULL or "" in Unset removes
+ * the program version for every network id. */
+ONCRPC_API oncRPCStat oncRPCRpcbSet(uv_loop_t *loop, const oncRPCAllocator *alloc,
+                                    uint32_t prog, uint32_t vers, const char *netid,
+                                    const char *uaddr, oncRPCPmapCb cb, void *data);
+ONCRPC_API oncRPCStat oncRPCRpcbUnset(uv_loop_t *loop, const oncRPCAllocator *alloc,
+                                      uint32_t prog, uint32_t vers, const char *netid,
+                                      oncRPCPmapCb cb, void *data);
+
+/* Universal address of an IPv4 or IPv6 socket address, into buf (at least
+ * ONCRPC_UADDR_MAX bytes is always enough). Returns 0, or -1 on failure. */
+ONCRPC_API int oncRPCUaddrFromSockaddr(const struct sockaddr *addr, char *buf, size_t len);
+/* Socket address of a universal address. Returns 0, or -1 if malformed. */
+ONCRPC_API int oncRPCUaddrToSockaddr(const char *uaddr, struct sockaddr_storage *addr);
+/* Network id for a protocol and address family (AF_INET or AF_INET6). */
+ONCRPC_API const char *oncRPCNetid(oncRPCProto proto, int family);
 
 /* ---- Server ------------------------------------------------------------- */
 
@@ -276,8 +342,13 @@ ONCRPC_API uint16_t oncRPCServerPort(const oncRPCServer *srv, oncRPCProto proto)
 ONCRPC_API oncRPCStat oncRPCServerRegister(oncRPCServer *srv, uint32_t prog, uint32_t vers,
                                            oncRPCDispatchFn dispatch, void *ctx);
 ONCRPC_API oncRPCStat oncRPCServerUnregister(oncRPCServer *srv, uint32_t prog, uint32_t vers);
-/* Register every listener for prog/vers with the local port mapper
- * (replacing stale entries). cb (may be NULL) reports the outcome. */
+/* Register every listener for prog/vers with rpcbind on the local host,
+ * replacing stale entries. Each listener is registered under its own network
+ * id and address, so IPv6 listeners are registered as tcp6/udp6. A daemon
+ * that speaks only version 2 (portmap) gets the IPv4 listeners; IPv6 ones
+ * then fail with ONCRPC_ERR_PMAPFAILURE. cb (may be NULL) reports the
+ * outcome: the first failure, or ONCRPC_OK. Unregister removes the program
+ * version for every network id. */
 ONCRPC_API oncRPCStat oncRPCServerPmapRegister(oncRPCServer *srv, uint32_t prog,
                                                uint32_t vers, oncRPCServerPmapCb cb,
                                                void *data);

@@ -4,7 +4,8 @@ liboncrpc is a clean-room C99 implementation of:
 
 - **XDR**: External Data Representation, RFC 4506
 - **ONC RPC version 2**: RFC 5531, over TCP (record marking) and UDP
-- **Port mapper version 2**: RFC 1833 (lookup and registration)
+- **rpcbind versions 3 and 4, port mapper version 2**: RFC 1833 (lookup
+  and registration, IPv4 and IPv6)
 - **The XDR/RPC language**: `.x` files, with a parser and the `oncrpcgen`
   code generator for client stubs, server dispatch and XDR routines
 
@@ -23,7 +24,7 @@ Design rules:
 
 | Header    | Contents                                                     |
 |-----------|--------------------------------------------------------------|
-| `oncrpc.h`| RPC client, server, port mapper; includes `xdr.h` and `<uv.h>` |
+| `oncrpc.h`| RPC client, server, rpcbind/port mapper; includes `xdr.h` and `<uv.h>` |
 | `xdr.h`   | allocator, XDR streams and routines (no libuv dependency)    |
 | `xspec.h` | `.x` parser and code generator API                           |
 
@@ -303,7 +304,7 @@ int main(void)
     oncRPCClient *client;
     int32_t a = 2, b = 3;
 
-    /* port 0 would ask the host's port mapper instead */
+    /* port 0 would ask the host's rpcbind instead */
     if (oncRPCClientCreate(loop, &app_alloc, "127.0.0.1", 5001, ADD_PROG, ADD_VERS,
                            ONCRPC_PROTO_TCP, NULL, NULL, &client) != ONCRPC_OK)
         return 1;
@@ -396,10 +397,17 @@ How servers behave:
 - **Automatic errors.** Unknown programs, versions and procedures,
   undecodable arguments, bad credentials and RPC version mismatches are
   answered with the proper RFC 5531 error replies.
-- **Port mapper.** `oncRPCServerPmapRegister` registers every listener for a
-  program version with the local port mapper (call it after
-  `oncRPCServerListen`). `oncRPCServerPmapUnregister` removes the
-  registration; call it before closing, as `examples/06_portmap/server.c` does.
+- **rpcbind.** `oncRPCServerPmapRegister` registers every listener for a
+  program version with rpcbind on the local host (call it after
+  `oncRPCServerListen`). Each listener is registered under its network id
+  (`tcp`, `udp`, `tcp6`, `udp6`) and universal address, so IPv6 listeners
+  can be found by IPv6 clients. Stale entries for the program version are
+  removed first. The registration uses rpcbind version 4, or 3, or the
+  port mapper's version 2 when the host has only that (version 2 cannot
+  describe IPv6, so IPv6 listeners then fail with `ONCRPC_ERR_PMAPFAILURE`
+  while the IPv4 ones are registered). `oncRPCServerPmapUnregister` removes
+  the program version for every network id; call it before closing, as
+  `examples/06_portmap/server.c` does.
 - **Closing.** `oncRPCServerClose` stops listening and closes connections.
   Its callback runs once all handles are closed **and** all outstanding
   requests have been finished (their replies are discarded).
@@ -553,7 +561,7 @@ checked once at the end. Use `ONCRPC_XDR_UNBOUNDED` as the maximum for `<>`.
 
 | Function | Description |
 |---|---|
-| `oncRPCClientCreate(loop, alloc, host, port, prog, vers, proto, readyCb, data, &clnt)` | start connecting; `port` 0 uses the port mapper |
+| `oncRPCClientCreate(loop, alloc, host, port, prog, vers, proto, readyCb, data, &clnt)` | start connecting; `port` 0 asks the host's rpcbind |
 | `oncRPCClientClose(clnt, cb, data)` | cancel outstanding calls, close |
 | `oncRPCClientCall(clnt, proc, xargs, args, xres, res, cb, data)` | start a call |
 | `oncRPCClientSetTimeout(clnt, ms)` | total time per call (default 25000) |
@@ -563,13 +571,37 @@ checked once at the end. Use `ONCRPC_XDR_UNBOUNDED` as the maximum for `<>`.
 | `oncRPCClientLastError(clnt)` | details of the call being reported |
 | `oncRPCClientData(clnt)` / `oncRPCClientAllocator(clnt)` / `oncRPCClientPending(clnt)` | accessors |
 
-### Port mapper
+### rpcbind and the port mapper
+
+rpcbind (versions 3 and 4) describes a service by a **network id** -
+`tcp`, `udp`, `tcp6` or `udp6` (`ONCRPC_NETID_*`) - and a **universal
+address**: the IP address as text followed by the port's two bytes, high
+first. `"127.0.0.1.4.1"` and `"::1.4.1"` are port 4 * 256 + 1 = 1025.
 
 | Function | Description |
 |---|---|
-| `oncRPCPmapGetPort(loop, alloc, host, prog, vers, proto, cb, data)` | look up a port; `cb(status, port, data)` |
-| `oncRPCPmapSet(loop, alloc, prog, vers, proto, port, cb, data)` | register with the local port mapper |
-| `oncRPCPmapUnset(loop, alloc, prog, vers, cb, data)` | unregister |
+| `oncRPCRpcbGetAddr(loop, alloc, host, prog, vers, netid, cb, data)` | look up a service; `cb(status, uaddr, data)` |
+| `oncRPCRpcbSet(loop, alloc, prog, vers, netid, uaddr, cb, data)` | register with the local rpcbind; `cb(status, ok, data)` |
+| `oncRPCRpcbUnset(loop, alloc, prog, vers, netid, cb, data)` | unregister; `netid` NULL or `""` for every network id |
+| `oncRPCUaddrFromSockaddr(addr, buf, len)` / `oncRPCUaddrToSockaddr(uaddr, &ss)` | convert universal addresses (`ONCRPC_UADDR_MAX` bytes is enough) |
+| `oncRPCNetid(proto, family)` | network id for TCP/UDP over `AF_INET`/`AF_INET6` |
+| `oncRPCPmapGetPort(loop, alloc, host, prog, vers, proto, cb, data)` | version 2: look up a port; `cb(status, port, data)` |
+| `oncRPCPmapSet(loop, alloc, prog, vers, proto, port, cb, data)` | version 2: register with the local port mapper |
+| `oncRPCPmapUnset(loop, alloc, prog, vers, cb, data)` | version 2: unregister |
+
+- The `oncRPCRpcb*` functions ask in version 4 and fall back to 3; the
+  `oncRPCPmap*` functions speak version 2 only. Clients created with port 0
+  and `oncRPCServerPmapRegister` try 4, then 3, then 2.
+- rpcbind answers a look-up for the transport the question arrives on, not
+  for the network id inside it. `oncRPCRpcbGetAddr` therefore asks over TCP
+  for `tcp`/`tcp6` and over UDP for `udp`/`udp6`, and over IPv4 or IPv6
+  according to how `host` resolves (IPv4 preferred): to find a `tcp6`
+  service, give an IPv6 host such as `"::1"`.
+- Registration goes to rpcbind on 127.0.0.1 over UDP. rpcbind records such
+  entries with the owner `unknown` and lets only the same owner, or the
+  superuser over its local socket, remove them; an entry that a program
+  running as root registered through that socket cannot be removed by
+  `oncRPCRpcbUnset`, and rpcbind answers false.
 
 ### Server
 
@@ -637,8 +669,13 @@ oncRPCXSpecFree(spec);
   execution for resends that arrive while their entry is cached; a resend
   arriving after the reply has been evicted or expired runs the procedure
   again. Make procedures idempotent where that matters.
-- **Port mapper.** The client speaks protocol version 2 over UDP, which
-  current `rpcbind` implementations support alongside versions 3 and 4.
+- **rpcbind.** Versions 4 and 3 (SET, UNSET and GETADDR) and the port
+  mapper's version 2 (SET, UNSET and GETPORT), falling back from newer to
+  older when a daemon reports that it does not speak a version. The other
+  procedures (DUMP, CALLIT, GETTIME, GETADDRLIST, ...) are not provided.
+  Lookups take only the port from the answer and connect to the address the
+  client resolved, so a service registered on another interface is reached
+  through the host's own address.
 - **Signals.** On Linux, FreeBSD and other Unix systems, writing to a TCP
   connection the peer has closed raises `SIGPIPE`, which ends the process
   unless it is ignored. libuv leaves this to the application, and so does

@@ -57,6 +57,30 @@ int      oncRPCIntGrow(const oncRPCAllocator *a, uint8_t **buf, size_t *cap, siz
 int oncRPCIntRecordExtract(const oncRPCAllocator *a, uint8_t *in, size_t *inlen, size_t max,
                            uint8_t **msg, size_t *msgcap, size_t *msglen);
 
+/*
+ * rpcbind / port mapper operations (pmap.c). One question - proc SET, UNSET
+ * or GETADDR (= GETPORT) - asked of host's daemon, starting at protocol
+ * version highVers and falling back to lowVers. netid NULL means: from
+ * proto and the family the host resolves to. cb gets the version that
+ * answered and, for GETADDR, the port (value) and the universal address
+ * (NULL from version 2); for SET/UNSET, rpcbind's boolean in value.
+ */
+typedef struct rpcbOp rpcbOp;
+typedef void (*oncRPCIntRpcbCb)(oncRPCStat status, uint32_t rpcbVers, uint32_t value,
+                                const char *uaddr, void *data);
+oncRPCStat oncRPCIntRpcbStart(uv_loop_t *loop, const oncRPCAllocator *alloc, const char *host,
+                              uint32_t proc, uint32_t highVers, uint32_t lowVers, uint32_t prog,
+                              uint32_t vers, const char *netid, oncRPCProto proto,
+                              const char *uaddr, oncRPCIntRpcbCb cb, void *data, rpcbOp **op);
+/* Abandon an operation whose callback has not run; done runs once it is
+ * gone. */
+void oncRPCIntRpcbCancel(rpcbOp *op, oncRPCCloseCb done, void *data);
+
+/* client.c: change the program version later calls use; the address family
+ * the client resolved to (0 before). */
+void oncRPCIntClientSetVersion(oncRPCClient *c, uint32_t vers);
+int  oncRPCIntClientFamily(const oncRPCClient *c);
+
 /* Map a libuv error to a library status. */
 oncRPCStat oncRPCIntUvStat(int uverr, oncRPCStat fallback);
 

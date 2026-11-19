@@ -17,6 +17,7 @@ typedef struct slistener {
     oncRPCServer     *srv;
     oncRPCProto       proto;
     uint16_t          port;
+    struct sockaddr_storage bound;  /* address actually bound */
     uint8_t          *ubuf;         /* UDP datagram buffer */
     struct slistener *next;
 } slistener;
@@ -1203,6 +1204,7 @@ oncRPCStat oncRPCServerListen(oncRPCServer *s, oncRPCProto proto, const char *ip
         uv_close(&l->io.h, on_listener_closed);
         return oncRPCIntUvStat(r, ONCRPC_ERR_FAILED);
     }
+    memcpy(&l->bound, &addr, sizeof(addr));
     l->port = (uint16_t)(addr.ss_family == AF_INET6
                              ? port_of(&((struct sockaddr_in6 *)&addr)->sin6_port)
                              : port_of(&((struct sockaddr_in *)&addr)->sin_port));
@@ -1338,43 +1340,68 @@ static void job_done(pmapJob *j)
     maybe_finish_close(s);
 }
 
-static void on_pmap_set(oncRPCStat st, uint32_t ok, void *data)
+static void job_failed(pmapJob *j, oncRPCStat st)
 {
-    pmapJob *j = (pmapJob *)data;
-    if (st == ONCRPC_OK && !ok)
-        st = ONCRPC_ERR_PMAPFAILURE;
     if (st != ONCRPC_OK && j->status == ONCRPC_OK)
         j->status = st;
+}
+
+static void on_pmap_set(oncRPCStat st, uint32_t rpcbVers, uint32_t ok, const char *uaddr,
+                        void *data)
+{
+    pmapJob *j = (pmapJob *)data;
+    (void)rpcbVers;
+    (void)uaddr;
+    job_failed(j, st == ONCRPC_OK && !ok ? ONCRPC_ERR_PMAPFAILURE : st);
     if (--j->outstanding == 0)
         job_done(j);
 }
 
-static void on_pmap_unset(oncRPCStat st, uint32_t ok, void *data)
+/* Stale entries are gone (or there were none), and rpcbVers is the protocol
+ * version the daemon answered in: register each listener in it. */
+static void on_pmap_unset(oncRPCStat st, uint32_t rpcbVers, uint32_t ok, const char *uaddr,
+                          void *data)
 {
     pmapJob *j = (pmapJob *)data;
     oncRPCServer *s = j->srv;
     slistener *l;
-    (void)ok;
+    (void)ok;     /* false just means there was nothing to remove */
+    (void)uaddr;
 
-    if (!j->registering) {
-        j->status = st;
+    if (!j->registering || st != ONCRPC_OK) {
+        /* Unregistering; or no daemon answered, so registering would only
+         * wait for the same failure once per listener. */
+        job_failed(j, st);
         job_done(j);
         return;
     }
-    /* Stale entries are gone (or there were none); register each listener. */
     j->outstanding = 1;   /* guard while starting */
     for (l = s->listeners; l != NULL && !s->closing; l = l->next) {
-        oncRPCStat r = oncRPCPmapSet(s->loop, s->alloc, j->prog, j->vers, l->proto, l->port,
-                                     on_pmap_set, j);
+        char uaddr_[ONCRPC_UADDR_MAX];
+        const char *netid = oncRPCNetid(l->proto, l->bound.ss_family);
+        oncRPCStat r;
+
+        if (rpcbVers == ONCRPC_PMAP_VERS && l->bound.ss_family == AF_INET6) {
+            /* The port mapper cannot describe IPv6 services. */
+            job_failed(j, ONCRPC_ERR_PMAPFAILURE);
+            continue;
+        }
+        if (netid == NULL ||
+            oncRPCUaddrFromSockaddr((const struct sockaddr *)&l->bound, uaddr_,
+                                    sizeof(uaddr_)) != 0) {
+            job_failed(j, ONCRPC_ERR_FAILED);
+            continue;
+        }
+        r = oncRPCIntRpcbStart(s->loop, s->alloc, "127.0.0.1", ONCRPC_RPCBPROC_SET, rpcbVers,
+                               rpcbVers, j->prog, j->vers, netid, l->proto, uaddr_,
+                               on_pmap_set, j, NULL);
         if (r == ONCRPC_OK)
             j->outstanding++;
-        else if (j->status == ONCRPC_OK)
-            j->status = r;
+        else
+            job_failed(j, r);
     }
-    if (s->listeners == NULL && j->status == ONCRPC_OK)
-        j->status = ONCRPC_ERR_INVALID;
-    if (st != ONCRPC_OK && j->status == ONCRPC_OK && j->outstanding == 1)
-        j->status = st;
+    if (s->listeners == NULL)
+        job_failed(j, ONCRPC_ERR_INVALID);
     if (--j->outstanding == 0)
         job_done(j);
 }
@@ -1398,7 +1425,11 @@ static oncRPCStat start_job(oncRPCServer *s, uint32_t prog, uint32_t vers, int r
     j->registering = registering;
     j->cb = cb;
     j->data = data;
-    st = oncRPCPmapUnset(s->loop, s->alloc, prog, vers, on_pmap_unset, j);
+    /* Remove the program version for every network id; this also finds the
+     * newest protocol version the daemon speaks. */
+    st = oncRPCIntRpcbStart(s->loop, s->alloc, "127.0.0.1", ONCRPC_RPCBPROC_UNSET,
+                            ONCRPC_RPCB_VERS4, ONCRPC_PMAP_VERS, prog, vers, "",
+                            ONCRPC_PROTO_TCP, "", on_pmap_unset, j, NULL);
     if (st != ONCRPC_OK) {
         oncRPCFree(s->alloc, j);
         return st;

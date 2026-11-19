@@ -1,9 +1,9 @@
-<#
+﻿<#
 .SYNOPSIS
     Runs liboncrpc's tests and examples from a Visual Studio build.
 
 .DESCRIPTION
-    Runs test_xdr, test_xspec, test_gen and test_rpc, then each example: the
+    Runs test_xdr, test_xspec, test_gen, test_rpc and test_rpcb, then each example: the
     example's server is started on a test port, its client is run against it,
     and the server is stopped. 06_portmap is skipped, as Windows has no port
     mapper (rpcbind). With -Soak, test_soak runs as well: many clients
@@ -70,7 +70,7 @@ function Program([string]$name) {
 
 # ---- Tests --------------------------------------------------------------------
 
-foreach ($test in 'test_xdr', 'test_xspec', 'test_gen', 'test_rpc') {
+foreach ($test in 'test_xdr', 'test_xspec', 'test_gen', 'test_rpc', 'test_rpcb') {
     Write-Host "== $test"
     & (Program $test)
     if ($LASTEXITCODE -ne 0) {

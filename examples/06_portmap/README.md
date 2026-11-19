@@ -1,4 +1,4 @@
-# 06_portmap: finding servers through the port mapper
+# 06_portmap: finding servers through rpcbind
 
 | File       | What it is                                                    |
 |------------|---------------------------------------------------------------|
@@ -26,12 +26,16 @@ kill -INT %1
 
 Things to notice:
 
-- **Finding the port.** Port `0` in `oncRPCClientCreate()` means "ask the
-  port mapper". The lookup happens asynchronously, before connecting.
+- **Finding the port.** Port `0` in `oncRPCClientCreate()` means "ask
+  rpcbind on the host". The lookup happens asynchronously, before
+  connecting, in rpcbind version 4 (or 3, or the old port mapper's version
+  2 if that is all the host has).
 - **Ready callback.** The optional ready callback (`on_ready`) says when the
   client is usable, or why it is not.
-- **Registering.** `oncRPCServerPmapRegister()` registers every listener.
-  Call it after `oncRPCServerListen()`.
+- **Registering.** `oncRPCServerPmapRegister()` registers every listener
+  under its network id (`tcp`, `udp`, or `tcp6`/`udp6` for IPv6) and
+  address. Call it after `oncRPCServerListen()`. `rpcinfo` shows the
+  entries while the server runs.
 - **Clean shutdown.** The server reacts to signals through `uv_signal_t`
   watchers on its loop. It unregisters, then closes; when nothing is left
   open, `uv_run()` returns.

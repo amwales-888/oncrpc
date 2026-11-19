@@ -193,10 +193,10 @@ ${EXDIR}/08_xdr/xdr_demo: ${EXDIR}/08_xdr/main.o ${EXDIR}/08_xdr/readings_xdr.o 
 # Tests
 # ---------------------------------------------------------------------------
 
-TEST_PROGRAMS=  ${TESTDIR}/test_xdr ${TESTDIR}/test_xspec ${TESTDIR}/test_gen \
+TEST_PROGRAMS=  ${TESTDIR}/test_xdr ${TESTDIR}/test_xspec ${TESTDIR}/test_rpcb ${TESTDIR}/test_gen \
                 ${TESTDIR}/test_rpc ${TESTDIR}/test_soak
 
-.for test in test_xdr test_xspec
+.for test in test_xdr test_xspec test_rpcb
 ${TESTDIR}/${test}: tests/${test}.c ${BUILD}/${LIBRARY} ${DEPEND_HEADERS}
 	@mkdir -p ${TESTDIR}
 	@echo "  CC     tests/${test}.c"
@@ -278,6 +278,7 @@ check: ${TEST_PROGRAMS} ${EXAMPLE_PROGRAMS} check-alloc
 	${Q}${TESTDIR}/test_xspec
 	${Q}${TESTDIR}/test_gen
 	${Q}${TESTDIR}/test_rpc
+	${Q}${TESTDIR}/test_rpcb
 	${Q}sh tests/run_examples.sh ${EXDIR}
 
 # A longer run under a lossy network: 'make soak SEED=7 SCALE=10'.

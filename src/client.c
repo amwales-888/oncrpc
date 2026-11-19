@@ -78,9 +78,7 @@ struct oncRPCClient {
     uv_getaddrinfo_t       gai;
     int                    gaiActive;
     uv_connect_t           connReq;
-    oncRPCClient          *pmap;       /* internal port mapper client */
-    uint32_t               pmapPort;
-    struct { uint32_t prog, vers, prot, port; } pmapArgs;
+    rpcbOp                *lookup;     /* asking rpcbind for the port */
 
     ccall                 *calls;      /* all outstanding calls, oldest first */
     ccall                 *callsTail;
@@ -274,10 +272,10 @@ void oncRPCClientClose(oncRPCClient *c, oncRPCCloseCb cb, void *data)
         c->closePending++;
         (void)uv_cancel((uv_req_t *)&c->gai);   /* callback still follows */
     }
-    if (c->pmap != NULL) {
+    if (c->lookup != NULL) {
         c->closePending++;
-        oncRPCClientClose(c->pmap, on_pmap_closed, c);
-        c->pmap = NULL;
+        oncRPCIntRpcbCancel(c->lookup, on_pmap_closed, c);
+        c->lookup = NULL;
     }
 }
 
@@ -737,42 +735,30 @@ static void start_resolve(oncRPCClient *c)
     c->gaiActive = 1;
 }
 
-static int xdr_mapping(oncRPCXdr *x, void *p)
-{
-    uint32_t *m = (uint32_t *)p;
-    return oncRPCXdrUint32(x, &m[0]) && oncRPCXdrUint32(x, &m[1]) &&
-           oncRPCXdrUint32(x, &m[2]) && oncRPCXdrUint32(x, &m[3]);
-}
-
-static int xdr_u32(oncRPCXdr *x, void *p)
-{
-    return oncRPCXdrUint32(x, (uint32_t *)p);
-}
-
-static void on_pmap_client_closed(void *data)
-{
-    (void)data;
-}
-
-static void on_pmap_reply(oncRPCClient *pm, oncRPCStat st, void *res, void *data)
+static void on_lookup_done(oncRPCStat st, uint32_t rpcbVers, uint32_t port, const char *uaddr,
+                           void *data)
 {
     oncRPCClient *c = (oncRPCClient *)data;
-    (void)res;
-    if (c->state == CS_CLOSING)
-        return;   /* our close is tearing the lookup client down */
-    c->pmap = NULL;
-    oncRPCClientClose(pm, on_pmap_client_closed, NULL);
+    (void)rpcbVers;
+    (void)uaddr;   /* only the port is used: the host is the one we were given */
+    c->lookup = NULL;
     if (st != ONCRPC_OK) {
-        resolution_failed(c, st == ONCRPC_ERR_UNKNOWNHOST ? st : ONCRPC_ERR_PMAPFAILURE);
+        resolution_failed(c, st);
         return;
     }
-    if (c->pmapPort == 0 || c->pmapPort > 65535u) {
-        resolution_failed(c, c->pmapPort == 0 ? ONCRPC_ERR_PROGNOTREGISTERED
-                                              : ONCRPC_ERR_PMAPFAILURE);
-        return;
-    }
-    c->port = (uint16_t)c->pmapPort;
+    c->port = (uint16_t)port;
     start_resolve(c);
+}
+
+void oncRPCIntClientSetVersion(oncRPCClient *c, uint32_t vers)
+{
+    if (c != NULL)
+        c->vers = vers;
+}
+
+int oncRPCIntClientFamily(const oncRPCClient *c)
+{
+    return c != NULL ? c->addr.ss_family : 0;
 }
 
 /* ---- Public API ------------------------------------------------------------------ */
@@ -832,19 +818,13 @@ oncRPCStat oncRPCClientCreate(uv_loop_t *loop, const oncRPCAllocator *alloc, con
         start_resolve(c);
         return ONCRPC_OK;
     }
-    /* Ask the port mapper on the host first. */
+    /* Ask rpcbind on the host first: GETADDR in version 4 or 3 (with the
+     * netid for the family the host resolves to), else the port mapper's
+     * GETPORT. */
     c->state = CS_PMAP;
-    c->pmapArgs.prog = prog;
-    c->pmapArgs.vers = vers;
-    c->pmapArgs.prot = (uint32_t)proto;
-    c->pmapArgs.port = 0;
-    st = oncRPCClientCreate(loop, alloc, host, ONCRPC_PMAP_PORT, ONCRPC_PMAP_PROG,
-                            ONCRPC_PMAP_VERS, ONCRPC_PROTO_UDP, NULL, NULL, &c->pmap);
-    if (st == ONCRPC_OK) {
-        oncRPCClientSetTimeout(c->pmap, 5000);
-        st = oncRPCClientCall(c->pmap, ONCRPC_PMAPPROC_GETPORT, xdr_mapping, &c->pmapArgs,
-                              xdr_u32, &c->pmapPort, on_pmap_reply, c);
-    }
+    st = oncRPCIntRpcbStart(loop, alloc, host, ONCRPC_RPCBPROC_GETADDR, ONCRPC_RPCB_VERS4,
+                            ONCRPC_PMAP_VERS, prog, vers, NULL, proto, NULL, on_lookup_done, c,
+                            &c->lookup);
     if (st != ONCRPC_OK) {
         *out = NULL;
         c->readyCb = NULL;

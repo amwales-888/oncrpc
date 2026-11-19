@@ -42,10 +42,11 @@ check` (or `tests\run_tests.ps1` on Windows) runs every example;
   `name.h` (types and prototypes), `name_xdr.c` (encoding and decoding),
   `name_clnt.c` (client functions, one per procedure) and `name_svc.c`
   (server dispatch and reply functions).
-- **The server** implements one `<proc>_<version>_svc()` function per
-  procedure and answers with `<proc>_<version>_reply()`.
-- **The client** calls `<proc>_<version>(client, arguments..., &result,
-  callback, data)`. The call returns at once; the callback runs when the
+- **The server** implements one `oncRPC<Proc>V<version>Svc()` function per
+  procedure and answers with `oncRPC<Proc>V<version>Reply()`; procedure
+  `ADD` in version 1 gives `oncRPCAddV1Svc()` and `oncRPCAddV1Reply()`.
+- **The client** calls `oncRPC<Proc>V<version>(client, arguments..., &result,
+  callback, data)`, e.g. `oncRPCAddV1(...)`. The call returns at once; the callback runs when the
   answer arrives.
 - **Your allocator.** Both sides pass a small allocator
   (`app_realloc`/`app_free`) to the library, which never calls malloc itself.

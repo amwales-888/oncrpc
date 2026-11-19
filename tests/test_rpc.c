@@ -62,12 +62,12 @@ static uv_loop_t g_loop;
 
 /* ---- Server procedures --------------------------------------------------------- */
 
-void calc_null_1_svc(oncRPCSvcReq *req)
+void oncRPCCalcNullV1Svc(oncRPCSvcReq *req)
 {
-    (void)calc_null_1_reply(req);
+    (void)oncRPCCalcNullV1Reply(req);
 }
 
-void calc_compute_1_svc(const calc_args *arg, oncRPCSvcReq *req)
+void oncRPCCalcComputeV1Svc(const calc_args *arg, oncRPCSvcReq *req)
 {
     calc_result r;
     memset(&r, 0, sizeof(r));
@@ -79,15 +79,15 @@ void calc_compute_1_svc(const calc_args *arg, oncRPCSvcReq *req)
                               : arg->op == OP_SUB ? arg->a - arg->b
                               : arg->op == OP_MUL ? arg->a * arg->b : arg->a / arg->b;
     }
-    (void)calc_compute_1_reply(req, &r);
+    (void)oncRPCCalcComputeV1Reply(req, &r);
 }
 
-void calc_stats_1_svc(const value_list *arg, oncRPCSvcReq *req)
+void oncRPCCalcStatsV1Svc(const value_list *arg, oncRPCSvcReq *req)
 {
     stats s;
     memset(&s, 0, sizeof(s));
     s.count = arg->value_list_len;
-    (void)calc_stats_1_reply(req, &s);
+    (void)oncRPCCalcStatsV1Reply(req, &s);
 }
 
 /* CALC_ECHO replies from a timer after 5 ms. */
@@ -105,11 +105,11 @@ static void on_echo_closed(uv_handle_t *h)
 static void on_echo_timer(uv_timer_t *t)
 {
     echo_job *j = (echo_job *)t->data;
-    (void)calc_echo_1_reply(j->req, j->text);
+    (void)oncRPCCalcEchoV1Reply(j->req, j->text);
     uv_close((uv_handle_t *)t, on_echo_closed);
 }
 
-void calc_echo_1_svc(const char *arg, oncRPCSvcReq *req)
+void oncRPCCalcEchoV1Svc(const char *arg, oncRPCSvcReq *req)
 {
     echo_job *j = (echo_job *)oncRPCAlloc(&A, sizeof(*j));
     if (j == NULL) {
@@ -123,7 +123,7 @@ void calc_echo_1_svc(const char *arg, oncRPCSvcReq *req)
     uv_timer_start(&j->t, on_echo_timer, 5, 0);
 }
 
-void calc_reverse_1_svc(const name_list *arg, oncRPCSvcReq *req)
+void oncRPCCalcReverseV1Svc(const name_list *arg, oncRPCSvcReq *req)
 {
     name_node nodes[16];
     const name_node *n;
@@ -134,7 +134,7 @@ void calc_reverse_1_svc(const name_list *arg, oncRPCSvcReq *req)
         nodes[i].next = head;
         head = &nodes[i++];
     }
-    (void)calc_reverse_1_reply(req, &head);
+    (void)oncRPCCalcReverseV1Reply(req, &head);
 }
 
 /* CALC_ADD(x, -12345) is held (never answered) until release_held(). */
@@ -143,7 +143,7 @@ static int32_t       g_heldSum[8];
 static int g_nheld;
 static int g_adds;   /* times CALC_ADD ran */
 
-void calc_add_1_svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
+void oncRPCCalcAddV1Svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
 {
     int32_t sum = *a + *b;
     g_adds++;
@@ -152,7 +152,7 @@ void calc_add_1_svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
         g_held[g_nheld++] = req;
         return;
     }
-    (void)calc_add_1_reply(req, &sum);
+    (void)oncRPCCalcAddV1Reply(req, &sum);
 }
 
 /* Answer the held requests. */
@@ -160,7 +160,7 @@ static void reply_held(void)
 {
     int i;
     for (i = 0; i < g_nheld; i++)
-        (void)calc_add_1_reply(g_held[i], &g_heldSum[i]);
+        (void)oncRPCCalcAddV1Reply(g_held[i], &g_heldSum[i]);
     g_nheld = 0;
 }
 
@@ -198,7 +198,7 @@ static oncRPCServer *start_server(uint16_t port)
         return NULL;
     if (oncRPCServerListen(s, ONCRPC_PROTO_TCP, "127.0.0.1", port) != ONCRPC_OK ||
         oncRPCServerListen(s, ONCRPC_PROTO_UDP, "127.0.0.1", port) != ONCRPC_OK ||
-        calc_prog_1_register(s, NULL) != ONCRPC_OK) {
+        oncRPCCalcProgV1Register(s, NULL) != ONCRPC_OK) {
         oncRPCServerClose(s, NULL, NULL);
         return NULL;
     }
@@ -234,7 +234,7 @@ static void f_compute(oncRPCClient *c, oncRPCStat st, void *res, void *data)
     if (st == ONCRPC_OK && r->status == 0 && r->calc_result_u.value == (int64_t)i * 3)
         f->ok++;
     if (st == ONCRPC_OK)
-        xdr_free_calc_result(&A, r);
+        oncRPCXdrFreeCalcResult(&A, r);
     f_close_if_done(c, f);
 }
 
@@ -258,7 +258,7 @@ static void f_reverse(oncRPCClient *c, oncRPCStat st, void *res, void *data)
         strcmp(l->next->name, "a") == 0 && l->next->next == NULL)
         f->ok++;
     if (st == ONCRPC_OK)
-        xdr_free_name_list(&A, (name_list *)res);
+        oncRPCXdrFreeNameList(&A, (name_list *)res);
     f_close_if_done(c, f);
 }
 
@@ -296,15 +296,15 @@ static void functional(oncRPCProto proto, uint16_t port)
         a.op = OP_MUL;
         a.a = i;
         a.b = 3;
-        if (calc_compute_1(c, &a, &f.res[i], f_compute, (void *)(intptr_t)i) == ONCRPC_OK)
+        if (oncRPCCalcComputeV1(c, &a, &f.res[i], f_compute, (void *)(intptr_t)i) == ONCRPC_OK)
             f.total++;
     }
-    if (calc_echo_1(c, "deferred", &f.echo, f_echo, NULL) == ONCRPC_OK)
+    if (oncRPCCalcEchoV1(c, "deferred", &f.echo, f_echo, NULL) == ONCRPC_OK)
         f.total++;
     {
         name_node b = { "b", NULL }, a = { "a", &b };
         name_list l = &a;
-        if (calc_reverse_1(c, &l, &f.rev, f_reverse, NULL) == ONCRPC_OK)
+        if (oncRPCCalcReverseV1(c, &l, &f.rev, f_reverse, NULL) == ONCRPC_OK)
             f.total++;
     }
     {
@@ -312,12 +312,12 @@ static void functional(oncRPCProto proto, uint16_t port)
         value_list l;
         l.value_list_len = 3;
         l.value_list_val = v;
-        if (calc_stats_1(c, &l, &f.st, f_stats, NULL) == ONCRPC_OK)
+        if (oncRPCCalcStatsV1(c, &l, &f.st, f_stats, NULL) == ONCRPC_OK)
             f.total++;
     }
     {
         int32_t x = 2, y = 3;
-        if (calc_add_1(c, &x, &y, &f.sum, f_add, NULL) == ONCRPC_OK)
+        if (oncRPCCalcAddV1(c, &x, &y, &f.sum, f_add, NULL) == ONCRPC_OK)
             f.total++;
     }
     CHECK(f.total == NCONC + 4);
@@ -400,7 +400,7 @@ static void errors(oncRPCServer *srv, uint16_t port, uint16_t deadport)
     CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, CALC_PROG, CALC_VERS,
                              ONCRPC_PROTO_TCP, NULL, NULL, &c) == ONCRPC_OK);
     oncRPCClientSetTimeout(c, 100);
-    CHECK(calc_add_1(c, &x, &y, &sum, e_call_close, &e) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c, &x, &y, &sum, e_call_close, &e) == ONCRPC_OK);
     WAIT(e.calls == 1 && g_closed == 1);
     CHECK(e.stat == ONCRPC_ERR_TIMEDOUT);
     release_held();
@@ -412,7 +412,7 @@ static void errors(oncRPCServer *srv, uint16_t port, uint16_t deadport)
                              ONCRPC_PROTO_UDP, NULL, NULL, &c) == ONCRPC_OK);
     oncRPCClientSetTimeout(c, 150);
     oncRPCClientSetRetry(c, 20);
-    CHECK(calc_add_1(c, &x, &y, &sum, e_call_close, &e) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c, &x, &y, &sum, e_call_close, &e) == ONCRPC_OK);
     WAIT(e.calls == 1 && g_closed == 1);
     CHECK(e.stat == ONCRPC_ERR_TIMEDOUT);
     {
@@ -430,7 +430,7 @@ static void errors(oncRPCServer *srv, uint16_t port, uint16_t deadport)
     g_closed = 0;
     CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, CALC_PROG, CALC_VERS,
                              ONCRPC_PROTO_TCP, NULL, NULL, &c) == ONCRPC_OK);
-    CHECK(calc_add_1(c, &x, &y, &sum, e_call, &e) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c, &x, &y, &sum, e_call, &e) == ONCRPC_OK);
     oncRPCClientClose(c, on_closed, NULL);
     CHECK(e.calls == 0);   /* never called from inside an API function */
     WAIT(g_closed == 1);
@@ -479,7 +479,7 @@ static void lifecycle(uint16_t port)
     memset(&e, 0, sizeof(e));
     CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", oncRPCServerPort(s, ONCRPC_PROTO_TCP),
                              CALC_PROG, CALC_VERS, ONCRPC_PROTO_TCP, NULL, NULL, &c) == ONCRPC_OK);
-    CHECK(calc_add_1(c, &x, &y, &sum, e_call, &e) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c, &x, &y, &sum, e_call, &e) == ONCRPC_OK);
     while (g_nheld == 0)
         uv_run(&g_loop, UV_RUN_ONCE);
     CHECK(oncRPCServerPending(s) == 1);
@@ -509,7 +509,7 @@ static void lifecycle(uint16_t port)
     CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, CALC_PROG, CALC_VERS,
                              ONCRPC_PROTO_TCP, NULL, NULL, &c) == ONCRPC_OK);
     e.calls = 0;
-    CHECK(calc_add_1(c, &x, &z, &sum, e_call, &e) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c, &x, &z, &sum, e_call, &e) == ONCRPC_OK);
     while (e.calls == 0)
         uv_run(&g_loop, UV_RUN_ONCE);
     CHECK(e.stat == ONCRPC_OK && sum == 3);
@@ -523,7 +523,7 @@ static void lifecycle(uint16_t port)
     CHECK(s != NULL);
     e.calls = 0;
     sum = 0;
-    CHECK(calc_add_1(c, &x, &z, &sum, e_call, &e) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c, &x, &z, &sum, e_call, &e) == ONCRPC_OK);
     while (e.calls == 0)
         uv_run(&g_loop, UV_RUN_ONCE);
     CHECK(e.stat == ONCRPC_OK && sum == 3);
@@ -830,13 +830,13 @@ static void limits(void)
     memset(&l, 0, sizeof(l));
     CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, CALC_PROG, CALC_VERS,
                              ONCRPC_PROTO_TCP, NULL, NULL, &c1) == ONCRPC_OK);
-    CHECK(calc_add_1(c1, &x, &two, &l.sum[0], l_call, &l) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c1, &x, &two, &l.sum[0], l_call, &l) == ONCRPC_OK);
     WAIT(l.calls == 1);
     CHECK(l.ok == 1 && l.sum[0] == 3);
     CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, CALC_PROG, CALC_VERS,
                              ONCRPC_PROTO_TCP, NULL, NULL, &c2) == ONCRPC_OK);
     oncRPCClientSetTimeout(c2, 2000);
-    CHECK(calc_add_1(c2, &x, &two, &l.sum[1], l_call, &l) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c2, &x, &two, &l.sum[1], l_call, &l) == ONCRPC_OK);
     WAIT(l.calls == 2);
     CHECK(l.ok == 1);
     oncRPCServerGetStats(s, &st);
@@ -851,7 +851,7 @@ static void limits(void)
     memset(&l, 0, sizeof(l));
     g_adds = 0;
     for (i = 0; i < 4; i++)
-        CHECK(calc_add_1(c1, &x, &held, &l.sum[i], l_call, &l) == ONCRPC_OK);
+        CHECK(oncRPCCalcAddV1(c1, &x, &held, &l.sum[i], l_call, &l) == ONCRPC_OK);
     WAIT(g_nheld == 2 && STAT(s, connectionsPaused) >= 1);
     sleep_ms(20);
     oncRPCServerGetStats(s, &st);
@@ -872,7 +872,7 @@ static void limits(void)
     memset(&l, 0, sizeof(l));
     g_adds = 0;
     for (i = 0; i < 3; i++)
-        CHECK(calc_add_1(c1, &x, &held, &l.sum[i], l_call, &l) == ONCRPC_OK);
+        CHECK(oncRPCCalcAddV1(c1, &x, &held, &l.sum[i], l_call, &l) == ONCRPC_OK);
     WAIT(g_nheld == 1);
     sleep_ms(20);
     CHECK(g_adds == 1);
@@ -893,13 +893,13 @@ static void limits(void)
     oncRPCServerGetStats(s, &st);
     CHECK(st.connectionsIdleClosed == 1 && st.connections == 0);
     memset(&l, 0, sizeof(l));
-    CHECK(calc_add_1(c1, &x, &two, &l.sum[0], l_call, &l) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c1, &x, &two, &l.sum[0], l_call, &l) == ONCRPC_OK);
     WAIT(l.calls == 1);
     CHECK(l.ok == 1 && l.sum[0] == 3);
 
     /* A connection with a request outstanding is not idle. */
     memset(&l, 0, sizeof(l));
-    CHECK(calc_add_1(c1, &x, &held, &l.sum[0], l_call, &l) == ONCRPC_OK);
+    CHECK(oncRPCCalcAddV1(c1, &x, &held, &l.sum[0], l_call, &l) == ONCRPC_OK);
     WAIT(g_nheld == 1);
     sleep_ms(150);
     oncRPCServerGetStats(s, &st);
@@ -948,7 +948,7 @@ static void o_call(oncRPCClient *c, oncRPCStat st, void *res, void *data)
 static void o_compute(oncRPCClient *c, oncRPCStat st, void *res, void *data)
 {
     if (st == ONCRPC_OK)
-        xdr_free_calc_result(&A, (calc_result *)res);
+        oncRPCXdrFreeCalcResult(&A, (calc_result *)res);
     o_call(c, st, res, data);
 }
 
@@ -994,8 +994,8 @@ static long oom_scenario(long fail_at)
                 continue;
             oncRPCClientSetTimeout(c, 300);
             oncRPCClientSetRetry(c, 50);
-            oc[i].outstanding += calc_compute_1(c, &a, &oc[i].res, o_compute, NULL) == ONCRPC_OK;
-            oc[i].outstanding += calc_echo_1(c, "x", &oc[i].echo, o_echo, NULL) == ONCRPC_OK;
+            oc[i].outstanding += oncRPCCalcComputeV1(c, &a, &oc[i].res, o_compute, NULL) == ONCRPC_OK;
+            oc[i].outstanding += oncRPCCalcEchoV1(c, "x", &oc[i].echo, o_echo, NULL) == ONCRPC_OK;
             if (oc[i].outstanding == 0)
                 oncRPCClientClose(c, NULL, NULL);
             else

@@ -209,44 +209,72 @@ status 1.
 
 ## 5. Generated code
 
-For `program P { version V { R X(A) = n; } = v; } = p;` the header contains
-(procedure and program names lower-cased, `v` the version number):
+Generated functions are named like the library's own: `oncRPC`, then the
+`.x` name in CamelCase, then the version and what the function does. The
+`.x` name is split into words at `_`, and each word starts with a capital;
+a word written all in capitals keeps only its first one. So `CALC_ADD`
+becomes `CalcAdd`, `calc_args` becomes `CalcArgs` and `myType` becomes
+`MyType`.
+
+For this interface (version number 1):
 
 ```c
-#define P p
-#define V v
-#define X n
-
-/* client stub: starts the call and returns at once */
-oncRPCStat x_v(oncRPCClient *clnt, const A *arg, R *res, oncRPCCallCb cb, void *data);
-
-/* server procedure you implement; finish req now or later */
-void x_v_svc(const A *arg, oncRPCSvcReq *req);
-
-/* reply helper: encodes *res (not retained) and finishes req */
-int x_v_reply(oncRPCSvcReq *req, const R *res);
-
-/* serve this version on a server */
-oncRPCStat p_v_register(oncRPCServer *srv, void *ctx);
+program CALC_PROG {
+    version CALC_VERS {
+        calc_result CALC_COMPUTE(calc_args) = 1;
+    } = 1;
+} = 0x20000099;
 ```
 
+the header contains:
+
+```c
+#define CALC_PROG 0x20000099
+#define CALC_VERS 1
+#define CALC_COMPUTE 1
+
+/* client stub: starts the call and returns at once */
+oncRPCStat oncRPCCalcComputeV1(oncRPCClient *clnt, const calc_args *arg, calc_result *res,
+                               oncRPCCallCb cb, void *data);
+
+/* server procedure you implement; finish req now or later */
+void oncRPCCalcComputeV1Svc(const calc_args *arg, oncRPCSvcReq *req);
+
+/* reply helper: encodes *res (not retained) and finishes req */
+int oncRPCCalcComputeV1Reply(oncRPCSvcReq *req, const calc_result *res);
+
+/* serve this version on a server */
+oncRPCStat oncRPCCalcProgV1Register(oncRPCServer *srv, void *ctx);
+```
+
+and for every type, here `calc_args`:
+
+```c
+int  oncRPCXdrCalcArgs(oncRPCXdr *xdrs, calc_args *objp);                  /* encode / decode / free */
+void oncRPCXdrFreeCalcArgs(const oncRPCAllocator *alloc, calc_args *objp); /* release decoded data   */
+```
+
+| `.x` declaration | Generated names |
+|---|---|
+| type `T` | `oncRPCXdrT`, `oncRPCXdrFreeT` |
+| procedure `X` in version number `N` | `oncRPCXVN` (client stub), `oncRPCXVNSvc` (you implement), `oncRPCXVNReply` |
+| program `P`, version number `N` | `oncRPCPVNRegister` |
+| procedure `X(A, B)` with several arguments | also the struct `oncRPCXVNArgs` that carries them, with `oncRPCXdrXVNArgs` and `oncRPCXdrFreeXVNArgs` |
+
+- Types, constants and the program, version and procedure numbers keep the
+  names they have in the `.x` file, as do struct fields and union arms.
 - `void` arguments or results are left out of the parameter lists.
 - `string` arguments and results are `const char *` in stubs, procedures and
   replies; the client receives a string result as `char **res`.
-- With several arguments, `X(A, B)`, they are passed separately
-  (`const A *arg1, const B *arg2`) and a struct `x_v_args` carries them on
-  the wire.
+- With several arguments they are passed separately
+  (`const A *arg1, const B *arg2`).
 - Procedure 0 is answered automatically unless the `.x` file defines it.
-
-For every type `T`:
-
-```c
-int  xdr_T(oncRPCXdr *xdrs, T *objp);                        /* encode / decode / free */
-void xdr_free_T(const oncRPCAllocator *alloc, T *objp);      /* release decoded data   */
-```
-
-Generated identifiers are derived from your `.x` names, so they live in your
-namespace rather than the library's.
+- Names that would clash are reported by `oncrpcgen` naming the `.x`
+  declarations involved: two declarations giving the same name (types
+  `a_b` and `A_B`, or `free_list`, whose XDR routine is `oncRPCXdrFreeList`,
+  and `list`, whose free routine has that name), or a type whose XDR routine would
+  have a name the library uses itself (a type called `bytes` would give
+  `oncRPCXdrBytes`). Type names may not begin with `oncRPC`.
 
 ## 6. Writing a client
 
@@ -281,8 +309,8 @@ int main(void)
         return 1;
 
     /* Calls may be made immediately; they are queued until connected.
-     * a and b are encoded before add_1 returns. */
-    add_1(client, &a, &b, &sum, on_add_done, NULL);
+     * a and b are encoded before oncRPCAddV1 returns. */
+    oncRPCAddV1(client, &a, &b, &sum, on_add_done, NULL);
 
     uv_run(loop, UV_RUN_DEFAULT);   /* returns once the client is closed */
     return 0;
@@ -290,7 +318,7 @@ int main(void)
 ```
 
 For results that contain allocated data (strings, arrays, lists), release
-them with the generated `xdr_free_<type>(alloc, &result)` once you are done
+them with the generated `oncRPCXdrFree<Type>(alloc, &result)` once you are done
 (see `examples/02_strings` to `04_lists`).
 
 How clients behave:
@@ -319,22 +347,22 @@ How clients behave:
 
 ## 7. Writing a server
 
-Implement the `*_svc` functions and answer with the generated `*_reply`
+Implement the `...Svc` functions and answer with the generated `...Reply`
 functions, either immediately (`examples/01_add/server.c`) or later
 (`examples/05_async/server.c`):
 
 ```c
-void add_1_svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
+void oncRPCAddV1Svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
 {
     int32_t sum = *a + *b;
-    add_1_reply(req, &sum);                 /* immediate reply */
+    oncRPCAddV1Reply(req, &sum);                 /* immediate reply */
 }
 
-void delay_1_svc(const uint32_t *ms, oncRPCSvcReq *req)
+void oncRPCDelayV1Svc(const uint32_t *ms, oncRPCSvcReq *req)
 {
     /* Deferred reply: keep req (the arguments stay valid too) and answer
      * later - here from a uv_timer callback that calls
-     * delay_1_reply(req, &value). */
+     * oncRPCDelayV1Reply(req, &value). */
     start_timer(req, *ms);
 }
 
@@ -346,7 +374,7 @@ int main(void)
     oncRPCServerCreate(loop, &app_alloc, &server);
     oncRPCServerListen(server, ONCRPC_PROTO_TCP, NULL, 5001);   /* NULL = 0.0.0.0; "::" for IPv6 */
     oncRPCServerListen(server, ONCRPC_PROTO_UDP, NULL, 5001);
-    add_prog_1_register(server, NULL);
+    oncRPCAddProgV1Register(server, NULL);
     /* optional: oncRPCServerPmapRegister(server, ADD_PROG, ADD_VERS, cb, data); */
     uv_run(loop, UV_RUN_DEFAULT);
     return 0;
@@ -356,7 +384,7 @@ int main(void)
 How servers behave:
 
 - **Finishing requests.** Every request must be finished exactly once, by a
-  `*_reply` function, `oncRPCSvcReply`, an `oncRPCSvcErr*` function or
+  `...Reply` function, `oncRPCSvcReply`, an `oncRPCSvcErr*` function or
   `oncRPCSvcDrop` (no reply). Until then, the request and its decoded
   arguments stay valid, so replies can be as asynchronous as you like.
 - **Request details.** `req` describes the call: `req->proc`, `req->vers`,
@@ -468,7 +496,7 @@ decoded arguments belong to the request.
 | What | Rule |
 |---|---|
 | Call arguments | Encoded before the stub / `oncRPCClientCall` returns: stack data is fine. |
-| Call results | Your storage, zero-initialised (stubs zero it), valid until the callback. On `ONCRPC_OK`, release decoded contents with `xdr_free_T(alloc, res)` (or `oncRPCFree` for a string). On failure, any partial decode has already been freed. |
+| Call results | Your storage, zero-initialised (stubs zero it), valid until the callback. On `ONCRPC_OK`, release decoded contents with `oncRPCXdrFreeT(alloc, res)` (or `oncRPCFree` for a string). On failure, any partial decode has already been freed. |
 | Server arguments | Owned by the request; valid until the request is finished. |
 | Server results | Encoded by the reply call and not retained: stack data and string literals are fine. |
 | Handles | Closed asynchronously; memory is released just before the close callback runs. |

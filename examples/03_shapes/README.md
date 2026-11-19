@@ -22,9 +22,9 @@ Things to notice:
   `result.area_result_u.error`. Set the discriminant and the matching arm.
 - **Concurrent calls.** Several calls can be outstanding on one client.
   Each needs its own result storage (`questions[i].result`).
-- **Telling calls apart.** The `data` pointer given to `area_1()` is handed
+- **Telling calls apart.** The `data` pointer given to `oncRPCAreaV1()` is handed
   back to the callback, which uses it to find the question.
 - **Counting completions.** The client closes when `outstanding` reaches 0.
-- **Freeing results.** `xdr_free_area_result()` releases whatever decoding
+- **Freeing results.** `oncRPCXdrFreeAreaResult()` releases whatever decoding
   allocated (here the error string). Call it once you are finished with a
   successful result.

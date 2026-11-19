@@ -34,7 +34,7 @@ static void app_free(void *ctx, void *ptr)
 static const oncRPCAllocator app_alloc = { app_realloc, app_free, NULL };
 
 /* "text" is a typedef for char *, so the argument arrives as text *. */
-void hello_1_svc(const text *name, oncRPCSvcReq *req)
+void oncRPCHelloV1Svc(const text *name, oncRPCSvcReq *req)
 {
     char reply[MAX_TEXT + 1];
     text result = reply;
@@ -42,10 +42,10 @@ void hello_1_svc(const text *name, oncRPCSvcReq *req)
     snprintf(reply, sizeof(reply), "Hello, %s!", *name);
     printf("server: HELLO(\"%s\") -> \"%s\"\n", *name, reply);
     fflush(stdout);
-    hello_1_reply(req, &result);
+    oncRPCHelloV1Reply(req, &result);
 }
 
-void shout_1_svc(const text *message, oncRPCSvcReq *req)
+void oncRPCShoutV1Svc(const text *message, oncRPCSvcReq *req)
 {
     char reply[MAX_TEXT + 1];
     text result = reply;
@@ -56,7 +56,7 @@ void shout_1_svc(const text *message, oncRPCSvcReq *req)
     reply[i] = '\0';
     printf("server: SHOUT(\"%s\") -> \"%s\"\n", *message, reply);
     fflush(stdout);
-    shout_1_reply(req, &result);
+    oncRPCShoutV1Reply(req, &result);
 }
 
 int main(int argc, char **argv)
@@ -77,7 +77,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "server: cannot listen on port %u\n", (unsigned)port);
         return 1;
     }
-    greet_prog_1_register(server, NULL);
+    oncRPCGreetProgV1Register(server, NULL);
 
     printf("server: listening on 127.0.0.1:%u\n", (unsigned)port);
     fflush(stdout);

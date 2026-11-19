@@ -110,11 +110,11 @@ static void on_slow_closed(uv_handle_t *h)
 static void on_slow(uv_timer_t *t)
 {
     slow *w = (slow *)t->data;
-    (void)calc_add_1_reply(w->req, &w->sum);
+    (void)oncRPCCalcAddV1Reply(w->req, &w->sum);
     uv_close((uv_handle_t *)t, on_slow_closed);
 }
 
-void calc_add_1_svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
+void oncRPCCalcAddV1Svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
 {
     int32_t sum = *a + *b;
     slow *w;
@@ -123,7 +123,7 @@ void calc_add_1_svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
         g_runs[*a]++;
     g_totalRuns++;
     if (*b <= 0) {
-        (void)calc_add_1_reply(req, &sum);
+        (void)oncRPCCalcAddV1Reply(req, &sum);
         return;
     }
     w = (slow *)malloc(sizeof(*w));
@@ -140,11 +140,11 @@ void calc_add_1_svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
 }
 
 /* The other procedures are not used here. */
-void calc_null_1_svc(oncRPCSvcReq *req) { oncRPCSvcErrNoProc(req); }
-void calc_compute_1_svc(const calc_args *arg, oncRPCSvcReq *req) { (void)arg; oncRPCSvcErrNoProc(req); }
-void calc_stats_1_svc(const value_list *arg, oncRPCSvcReq *req) { (void)arg; oncRPCSvcErrNoProc(req); }
-void calc_echo_1_svc(const char *arg, oncRPCSvcReq *req) { (void)arg; oncRPCSvcErrNoProc(req); }
-void calc_reverse_1_svc(const name_list *arg, oncRPCSvcReq *req) { (void)arg; oncRPCSvcErrNoProc(req); }
+void oncRPCCalcNullV1Svc(oncRPCSvcReq *req) { oncRPCSvcErrNoProc(req); }
+void oncRPCCalcComputeV1Svc(const calc_args *arg, oncRPCSvcReq *req) { (void)arg; oncRPCSvcErrNoProc(req); }
+void oncRPCCalcStatsV1Svc(const value_list *arg, oncRPCSvcReq *req) { (void)arg; oncRPCSvcErrNoProc(req); }
+void oncRPCCalcEchoV1Svc(const char *arg, oncRPCSvcReq *req) { (void)arg; oncRPCSvcErrNoProc(req); }
+void oncRPCCalcReverseV1Svc(const name_list *arg, oncRPCSvcReq *req) { (void)arg; oncRPCSvcErrNoProc(req); }
 
 /* ---- Lossy UDP relay --------------------------------------------------------------- */
 
@@ -441,7 +441,7 @@ static void refill(sclient *s)
         k->delay = chance(g_slowPct) ? (int32_t)(20 + rnd() % 100u) : 0;
         k->sum = 0;
         s->toIssue--;
-        if (calc_add_1(s->c, &k->id, &k->delay, &k->sum, on_add, k) != ONCRPC_OK) {
+        if (oncRPCCalcAddV1(s->c, &k->id, &k->delay, &k->sum, on_add, k) != ONCRPC_OK) {
             t->notStarted++;
             free(k);
             continue;
@@ -513,7 +513,7 @@ static void run_phase(const phase *ph)
     CHECK(oncRPCServerCreate(&g_loop, &A, &g_srv) == ONCRPC_OK);
     CHECK(oncRPCServerListen(g_srv, ONCRPC_PROTO_TCP, "127.0.0.1", 0) == ONCRPC_OK);
     CHECK(oncRPCServerListen(g_srv, ONCRPC_PROTO_UDP, "127.0.0.1", 0) == ONCRPC_OK);
-    CHECK(calc_prog_1_register(g_srv, NULL) == ONCRPC_OK);
+    CHECK(oncRPCCalcProgV1Register(g_srv, NULL) == ONCRPC_OK);
     CHECK(oncRPCServerSetLimits(g_srv, &ph->lim) == ONCRPC_OK);
     g_lim = ph->lim;
     port = oncRPCServerPort(g_srv, ONCRPC_PROTO_TCP);
@@ -684,7 +684,7 @@ static void conn_limit(void)
     g_cOk = g_cLost = g_cOther = 0;
     CHECK(oncRPCServerCreate(&g_loop, &A, &g_srv) == ONCRPC_OK);
     CHECK(oncRPCServerListen(g_srv, ONCRPC_PROTO_TCP, "127.0.0.1", 0) == ONCRPC_OK);
-    CHECK(calc_prog_1_register(g_srv, NULL) == ONCRPC_OK);
+    CHECK(oncRPCCalcProgV1Register(g_srv, NULL) == ONCRPC_OK);
     oncRPCServerGetLimits(g_srv, &lim);
     lim.maxConnections = LIMIT;
     CHECK(oncRPCServerSetLimits(g_srv, &lim) == ONCRPC_OK);
@@ -701,7 +701,7 @@ static void conn_limit(void)
         k[i].id = i;
         k[i].zero = 0;
         k[i].sum = -1;
-        CHECK(calc_add_1(c[i], &k[i].id, &k[i].zero, &k[i].sum, on_conn_call, &k[i]) ==
+        CHECK(oncRPCCalcAddV1(c[i], &k[i].id, &k[i].zero, &k[i].sum, on_conn_call, &k[i]) ==
               ONCRPC_OK);
     }
     WAIT(g_cOk + g_cLost + g_cOther == NC);

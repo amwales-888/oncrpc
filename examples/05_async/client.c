@@ -91,7 +91,7 @@ int main(int argc, char **argv)
     start_ms = uv_now(loop);
     for (i = 0; i < 3; i++) {
         printf("client: sending DELAY(%u)\n", (unsigned)delays[i]);
-        status = delay_1(client, &delays[i], &answers[i], on_delay_done, NULL);
+        status = oncRPCDelayV1(client, &delays[i], &answers[i], on_delay_done, NULL);
         if (status != ONCRPC_OK) {
             printf("client: cannot send DELAY: %s\n", oncRPCStrError(status));
             exit_code = 1;

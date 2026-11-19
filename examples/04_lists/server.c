@@ -29,7 +29,7 @@ static void app_free(void *ctx, void *ptr)
 
 static const oncRPCAllocator app_alloc = { app_realloc, app_free, NULL };
 
-void summarize_1_svc(const samples *s, oncRPCSvcReq *req)
+void oncRPCSummarizeV1Svc(const samples *s, oncRPCSvcReq *req)
 {
     summary result;
     double total = 0.0;
@@ -50,7 +50,7 @@ void summarize_1_svc(const samples *s, oncRPCSvcReq *req)
 
     printf("server: SUMMARIZE(%u numbers)\n", (unsigned)s->samples_len);
     fflush(stdout);
-    summarize_1_reply(req, &result);
+    oncRPCSummarizeV1Reply(req, &result);
 }
 
 static int compare_words(const void *x, const void *y)
@@ -62,7 +62,7 @@ static int compare_words(const void *x, const void *y)
 
 enum { MAX_SORT = 100 };   /* how many words this server is willing to sort */
 
-void sort_words_1_svc(const word_list *list, oncRPCSvcReq *req)
+void oncRPCSortWordsV1Svc(const word_list *list, oncRPCSvcReq *req)
 {
     const word *order[MAX_SORT];
     word sorted[MAX_SORT];
@@ -89,7 +89,7 @@ void sort_words_1_svc(const word_list *list, oncRPCSvcReq *req)
 
     printf("server: SORT_WORDS(%u words)\n", (unsigned)n);
     fflush(stdout);
-    sort_words_1_reply(req, &result);
+    oncRPCSortWordsV1Reply(req, &result);
 }
 
 int main(int argc, char **argv)
@@ -110,7 +110,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "server: cannot listen on port %u\n", (unsigned)port);
         return 1;
     }
-    lists_prog_1_register(server, NULL);
+    oncRPCListsProgV1Register(server, NULL);
 
     printf("server: listening on 127.0.0.1:%u\n", (unsigned)port);
     fflush(stdout);

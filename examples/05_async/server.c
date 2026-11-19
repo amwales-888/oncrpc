@@ -3,7 +3,7 @@
  *
  * usage: server [port]          (default port 5005)
  *
- * delay_1_svc() does not answer straight away. It starts a libuv timer and
+ * oncRPCDelayV1Svc() does not answer straight away. It starts a libuv timer and
  * returns. When the timer fires, the reply is sent. Meanwhile the server
  * keeps handling other requests. A request (and its arguments) stays valid
  * until it is answered.
@@ -53,12 +53,12 @@ static void on_timer(uv_timer_t *timer)
 
     printf("server: answering DELAY(%u)\n", (unsigned)p->ms);
     fflush(stdout);
-    delay_1_reply(p->req, &p->ms);   /* finishes the request */
+    oncRPCDelayV1Reply(p->req, &p->ms);   /* finishes the request */
 
     uv_close((uv_handle_t *)&p->timer, on_timer_closed);
 }
 
-void delay_1_svc(const uint32_t *ms, oncRPCSvcReq *req)
+void oncRPCDelayV1Svc(const uint32_t *ms, oncRPCSvcReq *req)
 {
     pending_reply *p = (pending_reply *)malloc(sizeof(*p));
 
@@ -95,7 +95,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "server: cannot listen on port %u\n", (unsigned)port);
         return 1;
     }
-    delay_prog_1_register(server, NULL);
+    oncRPCDelayProgV1Register(server, NULL);
 
     printf("server: listening on 127.0.0.1:%u\n", (unsigned)port);
     fflush(stdout);

@@ -36,4 +36,4 @@ Things to notice:
   watchers on its loop. It unregisters, then closes; when nothing is left
   open, `uv_run()` returns.
 - **No void arguments.** `GET_TIME(void)` produces a stub with no argument
-  parameter: `get_time_1(client, &result, cb, data)`.
+  parameter: `oncRPCGetTimeV1(client, &result, cb, data)`.

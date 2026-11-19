@@ -68,7 +68,7 @@ static void on_sort_done(oncRPCClient *client, oncRPCStat status, void *result, 
             printf(" %s", w->text);
         printf("\n");
         /* Frees every node and every string of the decoded list. */
-        xdr_free_word_list(&app_alloc, &sorted_words);
+        oncRPCXdrFreeWordList(&app_alloc, &sorted_words);
     } else {
         printf("client: SORT_WORDS failed: %s\n", oncRPCStrError(status));
         exit_code = 1;
@@ -116,13 +116,13 @@ int main(int argc, char **argv)
 
     /* Both arguments are encoded during the calls: the local arrays and
      * nodes above do not need to outlive them. */
-    status = summarize_1(client, &numbers, &numbers_summary, on_summarize_done, NULL);
+    status = oncRPCSummarizeV1(client, &numbers, &numbers_summary, on_summarize_done, NULL);
     if (status == ONCRPC_OK)
         outstanding++;
     else
         exit_code = 1;
 
-    status = sort_words_1(client, &words, &sorted_words, on_sort_done, NULL);
+    status = oncRPCSortWordsV1(client, &words, &sorted_words, on_sort_done, NULL);
     if (status == ONCRPC_OK)
         outstanding++;
     else

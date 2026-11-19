@@ -20,7 +20,7 @@ build/linux/release/examples/05_async/client
 Things to notice:
 
 - **Answering later.** A procedure does not have to answer before it
-  returns. Keep the `oncRPCSvcReq *` and call the `*_reply()` function
+  returns. Keep the `oncRPCSvcReq *` and call the `...Reply()` function
   whenever the result is ready: from a timer, a file read, a database
   callback, or a call to another RPC server. The request and its arguments
   stay valid until then.

@@ -3,12 +3,12 @@
  *
  * usage: xdr_demo
  *
- * The same routine, xdr_reading_log(), encodes, decodes and frees,
+ * The same routine, oncRPCXdrReadingLog(), encodes, decodes and frees,
  * depending on the stream it is given:
  *
  *   encode stream: C structures -> bytes (big-endian, 4-byte aligned)
  *   decode stream: bytes -> C structures (strings and arrays are allocated)
- *   free stream:   releases what decoding allocated (xdr_free_reading_log)
+ *   free stream:   releases what decoding allocated (oncRPCXdrFreeReadingLog)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,7 +82,7 @@ int main(void)
         fprintf(stderr, "out of memory\n");
         return 1;
     }
-    if (!xdr_reading_log(&encoder, &original)) {
+    if (!oncRPCXdrReadingLog(&encoder, &original)) {
         fprintf(stderr, "encoding failed\n");
         oncRPCXdrDestroy(&encoder);
         return 1;
@@ -100,22 +100,22 @@ int main(void)
     /* ---- Decode them back ------------------------------------------------ */
     memset(&copy, 0, sizeof(copy));   /* decode targets start zeroed */
     oncRPCXdrInitDecode(&decoder, &app_alloc, bytes, length);
-    ok = xdr_reading_log(&decoder, &copy);
+    ok = oncRPCXdrReadingLog(&decoder, &copy);
     if (!ok) {
         fprintf(stderr, "decoding failed\n");
-        xdr_free_reading_log(&app_alloc, &copy);   /* frees any partial result */
+        oncRPCXdrFreeReadingLog(&app_alloc, &copy);   /* frees any partial result */
         oncRPCXdrDestroy(&encoder);
         return 1;
     }
     print_log("decoded", &copy);
-    xdr_free_reading_log(&app_alloc, &copy);       /* the array and the strings */
+    oncRPCXdrFreeReadingLog(&app_alloc, &copy);       /* the array and the strings */
 
     /* ---- Damaged input is rejected, not trusted ---------------------------- */
     memset(&copy, 0, sizeof(copy));
     oncRPCXdrInitDecode(&decoder, &app_alloc, bytes, length - 5);
-    ok = xdr_reading_log(&decoder, &copy);
+    ok = oncRPCXdrReadingLog(&decoder, &copy);
     printf("\ndecoding all but the last 5 bytes: %s\n", ok ? "accepted (unexpected!)" : "rejected");
-    xdr_free_reading_log(&app_alloc, &copy);
+    oncRPCXdrFreeReadingLog(&app_alloc, &copy);
 
     oncRPCXdrDestroy(&encoder);
     return ok ? 1 : 0;

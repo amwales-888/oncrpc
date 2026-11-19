@@ -32,7 +32,7 @@ static const oncRPCAllocator app_alloc = { app_realloc, app_free, NULL };
 
 static const double pi = 3.14159265358979323846;
 
-void area_1_svc(const shape *s, oncRPCSvcReq *req)
+void oncRPCAreaV1Svc(const shape *s, oncRPCSvcReq *req)
 {
     area_result result;
 
@@ -67,7 +67,7 @@ void area_1_svc(const shape *s, oncRPCSvcReq *req)
 
     printf("server: AREA(kind %d) -> %s\n", (int)s->kind, result.ok ? "ok" : "error");
     fflush(stdout);
-    area_1_reply(req, &result);
+    oncRPCAreaV1Reply(req, &result);
 }
 
 int main(int argc, char **argv)
@@ -88,7 +88,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "server: cannot listen on port %u\n", (unsigned)port);
         return 1;
     }
-    shapes_prog_1_register(server, NULL);
+    oncRPCShapesProgV1Register(server, NULL);
 
     printf("server: listening on 127.0.0.1:%u\n", (unsigned)port);
     fflush(stdout);

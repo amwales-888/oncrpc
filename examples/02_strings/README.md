@@ -20,7 +20,7 @@ Things to notice:
 - **Results are allocated.** A decoded string comes from your allocator.
   Release it with `oncRPCFree(&app_alloc, s)`.
 - **Arguments are copied.** They are encoded before the stub returns, so
-  `greeting` can be freed right after `shout_1()`.
+  `greeting` can be freed right after `oncRPCShoutV1()`.
 - **Replies are copied.** The server's result can live in a stack buffer,
   because `*_reply()` encodes it immediately.
 - **Bounds are enforced.** `string<MAX_TEXT>` is checked when encoding and

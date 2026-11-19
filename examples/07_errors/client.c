@@ -80,7 +80,7 @@ static void on_step1(oncRPCClient *client, oncRPCStat status, void *result, void
     /* From now on, every call carries these AUTH_SYS credentials.
      * (oncRPCClientSetAuthSysDefault() would use this process's identity.) */
     oncRPCClientSetAuthSys(client, "example-host", 1000, 1000, 2, groups);
-    if (whoami_1(client, &whoami_text, on_step2, NULL) != ONCRPC_OK) {
+    if (oncRPCWhoamiV1(client, &whoami_text, on_step2, NULL) != ONCRPC_OK) {
         exit_code = 1;
         oncRPCClientClose(client, NULL, NULL);
     }
@@ -98,7 +98,7 @@ static void on_step2(oncRPCClient *client, oncRPCStat status, void *result, void
         oncRPCFree(&app_alloc, whoami_text);
     }
 
-    if (admin_only_1(client, on_step3, NULL) != ONCRPC_OK) {
+    if (oncRPCAdminOnlyV1(client, on_step3, NULL) != ONCRPC_OK) {
         exit_code = 1;
         oncRPCClientClose(client, NULL, NULL);
     }
@@ -131,7 +131,7 @@ static void on_step4(oncRPCClient *client, oncRPCStat status, void *result, void
     report("4. procedure 99", status, ONCRPC_ERR_PROCUNAVAIL);
 
     oncRPCClientSetTimeout(client, 500);
-    if (no_reply_1(client, on_step5, NULL) != ONCRPC_OK) {
+    if (oncRPCNoReplyV1(client, on_step5, NULL) != ONCRPC_OK) {
         exit_code = 1;
         oncRPCClientClose(client, NULL, NULL);
     }
@@ -200,7 +200,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "client: %s\n", oncRPCStrError(status));
         return 1;
     }
-    if (whoami_1(client, &whoami_text, on_step1, NULL) != ONCRPC_OK) {
+    if (oncRPCWhoamiV1(client, &whoami_text, on_step1, NULL) != ONCRPC_OK) {
         oncRPCClientClose(client, NULL, NULL);
         exit_code = 1;
     }

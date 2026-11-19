@@ -66,8 +66,8 @@ static void on_hello_done(oncRPCClient *client, oncRPCStat status, void *result,
     printf("client: HELLO -> \"%s\"\n", greeting);
 
     /* Second call. greeting is encoded right here, so it can be freed as
-     * soon as shout_1() returns. */
-    status = shout_1(client, &greeting, &shouted, on_shout_done, NULL);
+     * soon as oncRPCShoutV1() returns. */
+    status = oncRPCShoutV1(client, &greeting, &shouted, on_shout_done, NULL);
     oncRPCFree(&app_alloc, greeting);
     if (status != ONCRPC_OK) {
         printf("client: cannot start SHOUT: %s\n", oncRPCStrError(status));
@@ -100,7 +100,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    status = hello_1(client, &name, &greeting, on_hello_done, NULL);
+    status = oncRPCHelloV1(client, &name, &greeting, on_hello_done, NULL);
     if (status != ONCRPC_OK) {
         fprintf(stderr, "client: cannot start HELLO: %s\n", oncRPCStrError(status));
         oncRPCClientClose(client, NULL, NULL);

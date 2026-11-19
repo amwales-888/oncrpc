@@ -4,8 +4,8 @@
  * usage: server [port]          (default port 5001)
  *
  * oncrpcgen generated add_svc.c from add.x. That file receives requests,
- * decodes the arguments and calls add_1_svc() below. We work out the sum
- * and send it back with add_1_reply().
+ * decodes the arguments and calls oncRPCAddV1Svc() below. We work out the sum
+ * and send it back with oncRPCAddV1Reply().
  */
 /* glibc hides the POSIX declarations libuv needs under strict -std=c99. */
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
@@ -34,13 +34,13 @@ static void app_free(void *ctx, void *ptr)
 static const oncRPCAllocator app_alloc = { app_realloc, app_free, NULL };
 
 /* Called for every ADD request. */
-void add_1_svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
+void oncRPCAddV1Svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
 {
     int32_t sum = *a + *b;
 
     printf("server: %d + %d = %d\n", (int)*a, (int)*b, (int)sum);
     fflush(stdout);
-    add_1_reply(req, &sum);
+    oncRPCAddV1Reply(req, &sum);
 }
 
 int main(int argc, char **argv)
@@ -64,8 +64,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "server: cannot listen on port %u\n", (unsigned)port);
         return 1;
     }
-    /* Route requests for ADD_PROG version ADD_VERS to add_1_svc(). */
-    add_prog_1_register(server, NULL);
+    /* Route requests for ADD_PROG version ADD_VERS to oncRPCAddV1Svc(). */
+    oncRPCAddProgV1Register(server, NULL);
 
     printf("server: listening on 127.0.0.1:%u\n", (unsigned)port);
     fflush(stdout);

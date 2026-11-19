@@ -75,10 +75,10 @@ static int roundtrip(oncRPCXdrProc proc, void *obj, void *out)
     return ok;
 }
 
-static int w_everything(oncRPCXdr *x, void *p) { return xdr_everything(x, (everything *)p); }
-static int w_list(oncRPCXdr *x, void *p) { return xdr_list(x, (list *)p); }
-static int w_flag(oncRPCXdr *x, void *p) { return xdr_flag(x, (flag *)p); }
-static int w_args(oncRPCXdr *x, void *p) { return xdr_lists_1_args(x, (lists_1_args *)p); }
+static int w_everything(oncRPCXdr *x, void *p) { return oncRPCXdrEverything(x, (everything *)p); }
+static int w_list(oncRPCXdr *x, void *p) { return oncRPCXdrList(x, (list *)p); }
+static int w_flag(oncRPCXdr *x, void *p) { return oncRPCXdrFlag(x, (flag *)p); }
+static int w_args(oncRPCXdr *x, void *p) { return oncRPCXdrListsV1Args(x, (oncRPCListsV1Args *)p); }
 
 static void test_everything(void)
 {
@@ -147,7 +147,7 @@ static void test_everything(void)
     T_CHECK(out.maybe2 != NULL && out.maybe2->y == 8);
     T_CHECK(out.labels.labels_len == 2 && strcmp(out.labels.labels_val[1], "second") == 0);
     T_CHECK(out.nested.depth == 3 && strcmp(out.nested.why, "because") == 0);
-    xdr_free_everything(&A, &out);
+    oncRPCXdrFreeEverything(&A, &out);
     T_CHECK(out.name == NULL && out.pts.pts_val == NULL && out.maybe == NULL);
 
     /* Bounds enforced on encode: numbers is ints<SMALL> */
@@ -157,7 +157,7 @@ static void test_everything(void)
         e.numbers.ints_len = 5;
         e.numbers.ints_val = many;
         T_CHECK(oncRPCXdrInitEncodeDynamic(&x, &A, 64));
-        T_CHECK(!xdr_everything(&x, &e));
+        T_CHECK(!oncRPCXdrEverything(&x, &e));
         oncRPCXdrDestroy(&x);
         e.numbers.ints_len = 2;
         e.numbers.ints_val = nums;
@@ -169,7 +169,7 @@ static void test_unions_and_lists(void)
     point corners[3] = { { 0, 0 }, { 1, 0 }, { 0, 1 } };
     list n3, n2, n1, out;
     flag f, fout;
-    lists_1_args args, aout;
+    oncRPCListsV1Args args, aout;
 
     memset(&n1, 0, sizeof(n1));
     memset(&n2, 0, sizeof(n2));
@@ -192,7 +192,7 @@ static void test_unions_and_lists(void)
             out.next->item.shape_info_u.corners.corners_val[1].x == 1);
     T_CHECK(out.next->next != NULL && out.next->next->item.kind == 42 &&
             out.next->next->next == NULL);
-    xdr_free_list(&A, &out);
+    oncRPCXdrFreeList(&A, &out);
 
     /* bool discriminant with TRUE/FALSE cases */
     f.set = 1;
@@ -212,7 +212,7 @@ static void test_unions_and_lists(void)
     T_CHECK(roundtrip(w_args, &args, &aout));
     T_CHECK(aout.arg2.kind == SQUARE && strcmp(aout.arg3, "third") == 0 &&
             aout.arg1.next != NULL);
-    xdr_free_lists_1_args(&A, &aout);
+    oncRPCXdrFreeListsV1Args(&A, &aout);
 }
 
 static void test_wire_format(void)
@@ -223,14 +223,14 @@ static void test_wire_format(void)
     uint8_t buf[8];
     oncRPCXdr x;
     oncRPCXdrInitEncode(&x, buf, sizeof(buf));
-    T_CHECK(xdr_point(&x, &p) && memcmp(buf, exp, 8) == 0);
+    T_CHECK(oncRPCXdrPoint(&x, &p) && memcmp(buf, exp, 8) == 0);
 
     /* enum value outside the declaration still round-trips as an int */
     {
         shape s = SQUARE;
         static const uint8_t two[] = { 0, 0, 0, 2 };
         oncRPCXdrInitEncode(&x, buf, sizeof(buf));
-        T_CHECK(xdr_shape(&x, &s) && memcmp(buf, two, 4) == 0);
+        T_CHECK(oncRPCXdrShape(&x, &s) && memcmp(buf, two, 4) == 0);
     }
 }
 

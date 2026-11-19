@@ -40,12 +40,12 @@ static oncRPCServer *server;
 static uv_signal_t sigint_watcher;
 static uv_signal_t sigterm_watcher;
 
-void get_time_1_svc(oncRPCSvcReq *req)
+void oncRPCGetTimeV1Svc(oncRPCSvcReq *req)
 {
     uint64_t now = (uint64_t)time(NULL);
     printf("server: GET_TIME over %s\n", req->proto == ONCRPC_PROTO_TCP ? "TCP" : "UDP");
     fflush(stdout);
-    get_time_1_reply(req, &now);
+    oncRPCGetTimeV1Reply(req, &now);
 }
 
 /* ---- Registration --------------------------------------------------------- */
@@ -103,7 +103,7 @@ int main(void)
         fprintf(stderr, "server: cannot listen\n");
         return 1;
     }
-    clock_prog_1_register(server, NULL);
+    oncRPCClockProgV1Register(server, NULL);
     printf("server: listening on tcp/%u and udp/%u\n",
            (unsigned)oncRPCServerPort(server, ONCRPC_PROTO_TCP),
            (unsigned)oncRPCServerPort(server, ONCRPC_PROTO_UDP));

@@ -5,7 +5,7 @@
  *
  * All four AREA calls are started immediately, one after another, without
  * waiting. Each call has its own result storage. The data pointer passed
- * to area_1() comes back in the callback, so the callback knows which call
+ * to oncRPCAreaV1() comes back in the callback, so the callback knows which call
  * finished. A counter tells us when the last one is done.
  */
 /* glibc hides the POSIX declarations libuv needs under strict -std=c99. */
@@ -60,7 +60,7 @@ static void on_area_done(oncRPCClient *client, oncRPCStat status, void *result, 
     }
     /* The error string was allocated while decoding: release the result. */
     if (status == ONCRPC_OK)
-        xdr_free_area_result(&app_alloc, &q->result);
+        oncRPCXdrFreeAreaResult(&app_alloc, &q->result);
 
     outstanding--;
     if (outstanding == 0)
@@ -115,7 +115,7 @@ int main(int argc, char **argv)
     }
 
     for (i = 0; i < 4; i++) {
-        status = area_1(client, &questions[i].shape, &questions[i].result, on_area_done,
+        status = oncRPCAreaV1(client, &questions[i].shape, &questions[i].result, on_area_done,
                         &questions[i]);
         if (status == ONCRPC_OK) {
             outstanding++;

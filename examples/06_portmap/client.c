@@ -81,7 +81,7 @@ static void ask_time(uv_loop_t *loop, const char *host, oncRPCProto proto, uint6
         exit_code = 1;
         return;
     }
-    status = get_time_1(client, result, on_time, (void *)name);
+    status = oncRPCGetTimeV1(client, result, on_time, (void *)name);
     if (status != ONCRPC_OK) {
         printf("client: cannot ask over %s: %s\n", name, oncRPCStrError(status));
         exit_code = 1;

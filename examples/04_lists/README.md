@@ -21,6 +21,6 @@ Things to notice:
 - **Linked lists.** `word *next` is optional data: NULL ends the list. A
   list to send can be built from local variables.
 - **Freeing a list.** A received list is allocated node by node.
-  `xdr_free_word_list()` frees all of it.
+  `oncRPCXdrFreeWordList()` frees all of it.
 - **Bounds.** The server refuses more than 1000 numbers and words longer
   than 32 characters, because the interface says so.

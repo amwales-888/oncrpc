@@ -3,7 +3,7 @@
  *
  * usage: client [host [port]]   (default 127.0.0.1 5001)
  *
- * Calls are asynchronous: add_1() sends the request and returns at once.
+ * Calls are asynchronous: oncRPCAddV1() sends the request and returns at once.
  * When the answer arrives, libuv runs on_add_done(). uv_run() keeps the
  * program going until then.
  */
@@ -79,8 +79,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* a and b are encoded before add_1() returns; sum is filled in later. */
-    status = add_1(client, &a, &b, &sum, on_add_done, NULL);
+    /* a and b are encoded before oncRPCAddV1() returns; sum is filled in later. */
+    status = oncRPCAddV1(client, &a, &b, &sum, on_add_done, NULL);
     if (status != ONCRPC_OK) {
         fprintf(stderr, "client: cannot start ADD: %s\n", oncRPCStrError(status));
         oncRPCClientClose(client, NULL, NULL);

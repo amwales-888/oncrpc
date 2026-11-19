@@ -33,7 +33,7 @@ static void app_free(void *ctx, void *ptr)
 
 static const oncRPCAllocator app_alloc = { app_realloc, app_free, NULL };
 
-void whoami_1_svc(oncRPCSvcReq *req)
+void oncRPCWhoamiV1Svc(oncRPCSvcReq *req)
 {
     char text[400];
 
@@ -45,10 +45,10 @@ void whoami_1_svc(oncRPCSvcReq *req)
                  req->authSys->machinename);
     printf("server: WHOAMI -> %s\n", text);
     fflush(stdout);
-    whoami_1_reply(req, text);
+    oncRPCWhoamiV1Reply(req, text);
 }
 
-void admin_only_1_svc(oncRPCSvcReq *req)
+void oncRPCAdminOnlyV1Svc(oncRPCSvcReq *req)
 {
     if (req->authSys == NULL || req->authSys->uid != 0) {
         /* Reject the credentials: the client sees ONCRPC_ERR_AUTHERROR. */
@@ -59,10 +59,10 @@ void admin_only_1_svc(oncRPCSvcReq *req)
     }
     printf("server: ADMIN_ONLY allowed\n");
     fflush(stdout);
-    admin_only_1_reply(req);
+    oncRPCAdminOnlyV1Reply(req);
 }
 
-void no_reply_1_svc(oncRPCSvcReq *req)
+void oncRPCNoReplyV1Svc(oncRPCSvcReq *req)
 {
     /* Finish the request without answering: the client will time out. */
     printf("server: NO_REPLY dropped\n");
@@ -91,7 +91,7 @@ int main(int argc, char **argv)
     /* Only version 1 is served. Requests for other versions are answered
      * with PROG_MISMATCH automatically, unknown procedures with
      * PROC_UNAVAIL. */
-    secure_prog_1_register(server, NULL);
+    oncRPCSecureProgV1Register(server, NULL);
 
     printf("server: listening on 127.0.0.1:%u\n", (unsigned)port);
     fflush(stdout);

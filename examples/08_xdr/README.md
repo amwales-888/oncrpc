@@ -29,13 +29,13 @@ build/linux/release/examples/08_xdr/xdr_demo
 
 Things to notice:
 
-- **One routine, three jobs.** `xdr_reading_log()` encodes, decodes or
+- **One routine, three jobs.** `oncRPCXdrReadingLog()` encodes, decodes or
   frees, depending on the stream you pass it.
 - **Two kinds of encode buffer.** A dynamic encode stream grows through
   your allocator; `oncRPCXdrInitEncode()` uses a fixed buffer of yours
   instead.
 - **Decoding allocates.** Strings and arrays are allocated while decoding.
-  `xdr_free_reading_log()` releases them, including after a failed decode.
+  `oncRPCXdrFreeReadingLog()` releases them, including after a failed decode.
 - **Platform-independent bytes.** The output is big-endian and padded to
   4-byte multiples, the same on every platform. These bytes are exactly what
   an RPC call carries.

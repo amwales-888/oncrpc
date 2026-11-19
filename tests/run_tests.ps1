@@ -6,7 +6,9 @@
     Runs test_xdr, test_xspec, test_gen and test_rpc, then each example: the
     example's server is started on a test port, its client is run against it,
     and the server is stopped. 06_portmap is skipped, as Windows has no port
-    mapper (rpcbind). The exit status is 0 if everything passed.
+    mapper (rpcbind). With -Soak, test_soak runs as well: many clients
+    against small server limits, with UDP through a lossy relay (about ten
+    seconds at scale 1). The exit status is 0 if everything passed.
 
     Build the solution first (Build > Build Solution, or msbuild oncrpc.sln).
 
@@ -23,17 +25,31 @@
 .PARAMETER Suffix
     File name suffix of the programs (default .exe).
 
+.PARAMETER Soak
+    Also run test_soak.
+
+.PARAMETER Seed
+    test_soak's random seed (default 1).
+
+.PARAMETER Scale
+    Multiplies test_soak's number of calls (default 1).
+
 .EXAMPLE
     .\tests\run_tests.ps1
 .EXAMPLE
     .\tests\run_tests.ps1 -Configuration Debug
+.EXAMPLE
+    .\tests\run_tests.ps1 -Soak -Seed 7 -Scale 10
 #>
 param(
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
     [string]$BinDir = '',
     [int]$BasePort = 39123,
-    [string]$Suffix = '.exe'
+    [string]$Suffix = '.exe',
+    [switch]$Soak,
+    [int]$Seed = 1,
+    [int]$Scale = 1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -59,6 +75,15 @@ foreach ($test in 'test_xdr', 'test_xspec', 'test_gen', 'test_rpc') {
     & (Program $test)
     if ($LASTEXITCODE -ne 0) {
         Write-Host "-- ${test}: FAILED"
+        $failed = $true
+    }
+}
+
+if ($Soak) {
+    Write-Host "== test_soak"
+    & (Program 'test_soak') $Seed $Scale
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "-- test_soak: FAILED"
         $failed = $true
     }
 }

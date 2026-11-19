@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,6 +98,10 @@ int main(int argc, char **argv)
     uint16_t port = 5004;
     oncRPCServer *server;
 
+#ifdef SIGPIPE
+    /* A peer that closes its end must not kill the program (USAGE.md, "Signals"). */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     if (argc > 1)
         port = (uint16_t)atoi(argv[1]);
 

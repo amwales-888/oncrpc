@@ -611,6 +611,21 @@ oncRPCXSpecFree(spec);
   again. Make procedures idempotent where that matters.
 - **Port mapper.** The client speaks protocol version 2 over UDP, which
   current `rpcbind` implementations support alongside versions 3 and 4.
+- **Signals.** On Linux, FreeBSD and other Unix systems, writing to a TCP
+  connection the peer has closed raises `SIGPIPE`, which ends the process
+  unless it is ignored. libuv leaves this to the application, and so does
+  liboncrpc, since a library should not change process-wide signal handling.
+  Any program that uses liboncrpc, client or server, should ignore it at
+  startup, as the examples do (macOS and Windows need nothing):
+
+  ```c
+  #include <signal.h>
+  #ifdef SIGPIPE
+      signal(SIGPIPE, SIG_IGN);
+  #endif
+  ```
+
+  The library then sees the failed write as a closed connection.
 - **Hostile input.** Lengths are checked against declared bounds and the
   bytes actually available before allocating, records are size-limited, and
   booleans and small integers are range-checked.

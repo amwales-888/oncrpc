@@ -98,7 +98,7 @@ EXAMPLE_PROGRAMS := $(foreach e,$(RPC_EXAMPLES),\
                       $(EXDIR)/$(call example_dir,$(e))/client) \
                     $(EXDIR)/08_xdr/xdr_demo
 TEST_PROGRAMS := $(TESTDIR)/test_xdr $(TESTDIR)/test_xspec $(TESTDIR)/test_gen \
-                 $(TESTDIR)/test_rpc
+                 $(TESTDIR)/test_rpc $(TESTDIR)/test_soak
 
 # Quiet output; 'make V=1' shows full commands.
 ifeq ($(V),1)
@@ -113,7 +113,7 @@ endif
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all debug lib examples check check-alloc install uninstall clean
+.PHONY: all debug lib examples check check-alloc soak install uninstall clean
 
 all: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(EXAMPLE_PROGRAMS)
 	$(Q)ln -sf $(BUILD)/$(PROGRAM) $(PROGRAM)
@@ -270,6 +270,13 @@ $(TESTDIR)/test_rpc: tests/test_rpc.c $(TESTDIR)/calc/calc_xdr.o $(TESTDIR)/calc
 	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/calc $(CFLAGS) $(LDFLAGS) -o $@ $< \
 	    $(filter %.o,$^) $(BUILD)/$(LIBRARY) $(LDLIBS)
 
+# test_soak: many clients, a lossy UDP relay and small server limits.
+$(TESTDIR)/test_soak: tests/test_soak.c $(TESTDIR)/calc/calc_xdr.o $(TESTDIR)/calc/calc_clnt.o \
+                      $(TESTDIR)/calc/calc_svc.o $(BUILD)/$(LIBRARY)
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/calc $(CFLAGS) $(LDFLAGS) -o $@ $< \
+	    $(filter %.o,$^) $(BUILD)/$(LIBRARY) $(LDLIBS)
+
 # The library must never call the C allocator: check what its objects import.
 check-alloc: $(LIB_OBJECTS)
 	$(Q)if $(NM) -u $(LIB_OBJECTS) | grep -Ew '_?(malloc|calloc|realloc|free|strdup|strndup|aligned_alloc|posix_memalign)$$'; then \
@@ -282,6 +289,12 @@ check: $(TEST_PROGRAMS) $(EXAMPLE_PROGRAMS) check-alloc
 	$(Q)$(TESTDIR)/test_gen
 	$(Q)$(TESTDIR)/test_rpc
 	$(Q)sh tests/run_examples.sh $(EXDIR)
+
+# A longer run under a lossy network: 'make soak SEED=7 SCALE=10'.
+SEED  ?= 1
+SCALE ?= 1
+soak: $(TESTDIR)/test_soak
+	$(Q)$(TESTDIR)/test_soak $(SEED) $(SCALE)
 
 # ---------------------------------------------------------------------------
 # Install

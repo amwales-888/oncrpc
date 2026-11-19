@@ -92,7 +92,7 @@ Q=              @
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all debug lib examples check check-alloc install uninstall clean
+.PHONY: all debug lib examples check check-alloc soak install uninstall clean
 .MAIN: all
 
 LIB_OBJECTS=
@@ -194,7 +194,7 @@ ${EXDIR}/08_xdr/xdr_demo: ${EXDIR}/08_xdr/main.o ${EXDIR}/08_xdr/readings_xdr.o 
 # ---------------------------------------------------------------------------
 
 TEST_PROGRAMS=  ${TESTDIR}/test_xdr ${TESTDIR}/test_xspec ${TESTDIR}/test_gen \
-                ${TESTDIR}/test_rpc
+                ${TESTDIR}/test_rpc ${TESTDIR}/test_soak
 
 .for test in test_xdr test_xspec
 ${TESTDIR}/${test}: tests/${test}.c ${BUILD}/${LIBRARY} ${DEPEND_HEADERS}
@@ -244,12 +244,14 @@ ${TESTDIR}/calc/calc_${part}.o: ${TESTDIR}/calc/.generated ${DEPEND_HEADERS}
 	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -c -o ${.TARGET} ${TESTDIR}/calc/calc_${part}.c
 .endfor
 
-${TESTDIR}/test_rpc: tests/test_rpc.c ${TESTDIR}/calc/calc_xdr.o ${TESTDIR}/calc/calc_clnt.o \
+.for test in test_rpc test_soak
+${TESTDIR}/${test}: tests/${test}.c ${TESTDIR}/calc/calc_xdr.o ${TESTDIR}/calc/calc_clnt.o \
                      ${TESTDIR}/calc/calc_svc.o ${BUILD}/${LIBRARY}
-	@echo "  CC     tests/test_rpc.c"
-	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -I${TESTDIR}/calc ${LDFLAGS} -o ${.TARGET} tests/test_rpc.c \
+	@echo "  CC     tests/${test}.c"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -I${TESTDIR}/calc ${LDFLAGS} -o ${.TARGET} tests/${test}.c \
 	    ${TESTDIR}/calc/calc_xdr.o ${TESTDIR}/calc/calc_clnt.o ${TESTDIR}/calc/calc_svc.o \
 	    ${BUILD}/${LIBRARY} ${LDLIBS}
+.endfor
 
 # ---------------------------------------------------------------------------
 # Top-level targets
@@ -277,6 +279,12 @@ check: ${TEST_PROGRAMS} ${EXAMPLE_PROGRAMS} check-alloc
 	${Q}${TESTDIR}/test_gen
 	${Q}${TESTDIR}/test_rpc
 	${Q}sh tests/run_examples.sh ${EXDIR}
+
+# A longer run under a lossy network: 'make soak SEED=7 SCALE=10'.
+SEED?=  1
+SCALE?= 1
+soak: ${TESTDIR}/test_soak
+	${Q}${TESTDIR}/test_soak ${SEED} ${SCALE}
 
 install: all
 	install -d ${DESTDIR}${BINDIR} ${DESTDIR}${LIBDIR} ${DESTDIR}${INCLUDEDIR}

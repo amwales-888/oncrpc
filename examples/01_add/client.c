@@ -12,6 +12,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -61,6 +62,10 @@ int main(int argc, char **argv)
     int32_t a = 2;
     int32_t b = 3;
 
+#ifdef SIGPIPE
+    /* A peer that closes its end must not kill the program (USAGE.md, "Signals"). */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     if (argc > 1)
         host = argv[1];
     if (argc > 2)

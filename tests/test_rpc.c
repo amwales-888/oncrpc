@@ -17,6 +17,7 @@
 #endif
 
 #include <stddef.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1042,6 +1043,10 @@ int main(void)
     oncRPCServer *s;
     uint16_t port, deadport;
 
+#ifdef SIGPIPE
+    /* A peer that closes its end must not kill the program (USAGE.md, "Signals"). */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     setvbuf(stdout, NULL, _IONBF, 0);
     CHECK(uv_loop_init(&g_loop) == 0);
 

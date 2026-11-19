@@ -93,6 +93,10 @@ int main(void)
 {
     uv_loop_t *loop = uv_default_loop();
 
+#ifdef SIGPIPE
+    /* A peer that closes its end must not kill the program (USAGE.md, "Signals"). */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     if (oncRPCServerCreate(loop, &app_alloc, &server) != ONCRPC_OK ||
         oncRPCServerListen(server, ONCRPC_PROTO_TCP, NULL, 0) != ONCRPC_OK ||
         oncRPCServerListen(server, ONCRPC_PROTO_UDP, NULL, 0) != ONCRPC_OK) {

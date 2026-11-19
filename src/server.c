@@ -30,7 +30,7 @@ typedef struct sconn {
     struct sockaddr_storage peer;
     struct svcCall         *reqs;   /* outstanding requests from this connection */
     size_t                  nreqs;
-    uint64_t                lastActive;   /* uv_now of the last traffic */
+    uint32_t                idleTicks;    /* housekeeping ticks with no traffic */
     int                     paused;       /* reading stopped by a request limit */
     int                     closing;
     struct sconn           *next;
@@ -114,6 +114,7 @@ struct oncRPCServer {
     uint8_t               *msg;           /* reassembled TCP record */
     size_t                 msgcap;
     uv_timer_t             tick;          /* idle connections, cache expiry */
+    uint64_t               tickMs;        /* its period; 0 when stopped */
     uv_idle_t              resume;        /* restarts paused connections */
     drcEntry             **drcTable;
     uint32_t               drcBuckets;    /* power of two */
@@ -445,7 +446,7 @@ static void release(svcCall *r)
         if (r->next)
             r->next->prev = r->prev;
         c->nreqs--;
-        c->lastActive = uv_now(s->loop);
+        c->idleTicks = 0;
     }
     oncRPCFree(s->alloc, r);
     s->pendingReqs--;
@@ -911,7 +912,7 @@ static void on_conn_read(uv_stream_t *st, ssize_t nread, const uv_buf_t *b)
     if (nread == 0)
         return;
     c->len += (size_t)nread;
-    c->lastActive = uv_now(c->srv->loop);
+    c->idleTicks = 0;
     conn_process(c);
 }
 
@@ -951,7 +952,7 @@ static void on_connection(uv_stream_t *server, int status)
     }
     c->srv = s;
     c->tcp.data = c;
-    c->lastActive = uv_now(s->loop);
+    c->idleTicks = 0;
     c->next = s->conns;
     if (s->conns)
         s->conns->prev = c;
@@ -1007,25 +1008,38 @@ static void on_udp_recv(uv_udp_t *u, ssize_t nread, const uv_buf_t *b,
         drc_remove(s, drc);
 }
 
-/* Periodic housekeeping: close idle connections and expire cached replies. */
+/*
+ * Periodic housekeeping: close idle connections and expire cached replies.
+ *
+ * Idleness is counted in ticks rather than measured against the loop's
+ * clock. libuv runs timers before it reads sockets, so when the loop is busy
+ * enough that one iteration outlasts the idle timeout, a connection whose
+ * next request is already waiting unread would look idle by the clock. By
+ * ticks, that connection is reset by the read in the same iteration and is
+ * closed only after the timeout has passed over at least two quiet ticks.
+ */
 static void on_tick(uv_timer_t *t)
 {
     oncRPCServer *s = (oncRPCServer *)t->data;
-    uint64_t now = uv_now(s->loop);
     sconn *c, *next;
 
     if (s->closing)
         return;
-    if (s->lim.idleTimeoutMs > 0) {
+    if (s->lim.idleTimeoutMs > 0 && s->tickMs > 0) {
         for (c = s->conns; c != NULL; c = next) {
             next = c->next;
-            if (c->nreqs == 0 && !c->paused && now - c->lastActive >= s->lim.idleTimeoutMs) {
+            if (c->nreqs > 0 || c->paused) {
+                c->idleTicks = 0;
+                continue;
+            }
+            c->idleTicks++;
+            if (c->idleTicks >= 2 && (uint64_t)c->idleTicks * s->tickMs >= s->lim.idleTimeoutMs) {
                 s->stats.connectionsIdleClosed++;
                 conn_close(c);
             }
         }
     }
-    drc_expire(s, now);
+    drc_expire(s, uv_now(s->loop));
 }
 
 /* Run the housekeeping timer often enough for the shortest time limit. */
@@ -1041,13 +1055,15 @@ static void restart_tick(oncRPCServer *s)
         if (t[i] > 0 && (period == 0 || t[i] / 4 < period))
             period = t[i] / 4;
     (void)uv_timer_stop(&s->tick);
+    s->tickMs = 0;
     if (period == 0 || s->closing)
         return;
     if (period < 10)
         period = 10;
     if (period > 1000)
         period = 1000;
-    (void)uv_timer_start(&s->tick, on_tick, period, period);
+    if (uv_timer_start(&s->tick, on_tick, period, period) == 0)
+        s->tickMs = period;
 }
 
 /* ---- Server object ------------------------------------------------------------------- */

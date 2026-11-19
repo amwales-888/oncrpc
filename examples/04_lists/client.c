@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -83,6 +84,10 @@ int main(int argc, char **argv)
     oncRPCClient *client;
     oncRPCStat status;
 
+#ifdef SIGPIPE
+    /* A peer that closes its end must not kill the program (USAGE.md, "Signals"). */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     /* An array argument: point samples_val at the data, set samples_len. */
     double values[6] = { 4.5, -2.0, 10.0, 3.25, 7.0, 0.5 };
     samples numbers;

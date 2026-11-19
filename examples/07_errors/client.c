@@ -20,6 +20,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -183,6 +184,10 @@ int main(int argc, char **argv)
     oncRPCClient *client;
     oncRPCStat status;
 
+#ifdef SIGPIPE
+    /* A peer that closes its end must not kill the program (USAGE.md, "Signals"). */
+    signal(SIGPIPE, SIG_IGN);
+#endif
     loop = uv_default_loop();
     if (argc > 1)
         host = argv[1];

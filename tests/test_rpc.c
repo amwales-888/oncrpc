@@ -16,6 +16,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -137,16 +138,29 @@ void calc_reverse_1_svc(const name_list *arg, oncRPCSvcReq *req)
 
 /* CALC_ADD(x, -12345) is held (never answered) until release_held(). */
 static oncRPCSvcReq *g_held[8];
+static int32_t       g_heldSum[8];
 static int g_nheld;
+static int g_adds;   /* times CALC_ADD ran */
 
 void calc_add_1_svc(const int32_t *a, const int32_t *b, oncRPCSvcReq *req)
 {
     int32_t sum = *a + *b;
+    g_adds++;
     if (*b == -12345 && g_nheld < 8) {
+        g_heldSum[g_nheld] = sum;
         g_held[g_nheld++] = req;
         return;
     }
     (void)calc_add_1_reply(req, &sum);
+}
+
+/* Answer the held requests. */
+static void reply_held(void)
+{
+    int i;
+    for (i = 0; i < g_nheld; i++)
+        (void)calc_add_1_reply(g_held[i], &g_heldSum[i]);
+    g_nheld = 0;
 }
 
 static void release_held(void)
@@ -346,7 +360,7 @@ static void e_call_close(oncRPCClient *c, oncRPCStat st, void *res, void *data)
     oncRPCClientClose(c, on_closed, NULL);
 }
 
-static void errors(uint16_t port, uint16_t deadport)
+static void errors(oncRPCServer *srv, uint16_t port, uint16_t deadport)
 {
     estate e;
     oncRPCClient *c;
@@ -400,7 +414,14 @@ static void errors(uint16_t port, uint16_t deadport)
     CHECK(calc_add_1(c, &x, &y, &sum, e_call_close, &e) == ONCRPC_OK);
     WAIT(e.calls == 1 && g_closed == 1);
     CHECK(e.stat == ONCRPC_ERR_TIMEDOUT);
-    CHECK(g_nheld > 1);   /* the request was retransmitted */
+    {
+        /* The request was retransmitted, but the duplicate cache kept the
+         * resends from running the procedure again. */
+        oncRPCServerStats st;
+        oncRPCServerGetStats(srv, &st);
+        CHECK(g_nheld == 1);
+        CHECK(st.duplicatesDropped > 0);
+    }
     release_held();
 
     /* close with a call outstanding: cancelled */
@@ -510,7 +531,390 @@ static void lifecycle(uint16_t port)
     run();
 }
 
-/* ---- 4. Out-of-memory sweep -------------------------------------------------------- */
+/* ---- 4. Duplicate-request cache and limits ------------------------------------------ */
+
+/* A bare UDP socket, so that requests can be resent byte for byte. */
+static uv_udp_t g_raw;
+static uint8_t  g_rawBuf[512];
+static uint8_t  g_lastReply[512];
+static size_t   g_lastReplyLen;
+static int      g_replies;
+
+static void raw_alloc(uv_handle_t *h, size_t suggested, uv_buf_t *b)
+{
+    (void)h;
+    (void)suggested;
+    *b = uv_buf_init((char *)g_rawBuf, (unsigned int)sizeof(g_rawBuf));
+}
+
+static void raw_recv(uv_udp_t *u, ssize_t n, const uv_buf_t *b, const struct sockaddr *a,
+                     unsigned flags)
+{
+    (void)u;
+    (void)a;
+    (void)flags;
+    if (n <= 0)
+        return;
+    memcpy(g_lastReply, b->base, (size_t)n);
+    g_lastReplyLen = (size_t)n;
+    g_replies++;
+}
+
+static void put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static uint32_t get32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+/* Send CALC_ADD(x, y) with AUTH_NONE as one datagram. */
+static void raw_add(uint16_t port, uint32_t xid, int32_t x, int32_t y)
+{
+    uint32_t w[12];
+    uint8_t msg[48];
+    struct sockaddr_in to;
+    uv_buf_t b;
+    int i;
+
+    w[0] = xid;
+    w[1] = 0;            /* CALL */
+    w[2] = 2;            /* RPC version */
+    w[3] = CALC_PROG;
+    w[4] = CALC_VERS;
+    w[5] = CALC_ADD;
+    w[6] = w[7] = 0;     /* credential: AUTH_NONE, empty */
+    w[8] = w[9] = 0;     /* verifier */
+    w[10] = (uint32_t)x;
+    w[11] = (uint32_t)y;
+    for (i = 0; i < 12; i++)
+        put32(msg + 4 * i, w[i]);
+    uv_ip4_addr("127.0.0.1", port, &to);
+    b = uv_buf_init((char *)msg, (unsigned int)sizeof(msg));
+    CHECK(uv_udp_try_send(&g_raw, &b, 1, (const struct sockaddr *)&to) == (int)sizeof(msg));
+}
+
+/* The sum in the last reply, which must be a successful one for xid. */
+static int32_t last_sum(uint32_t xid)
+{
+    CHECK(g_lastReplyLen == 28 && get32(g_lastReply) == xid && get32(g_lastReply + 20) == 0);
+    return (int32_t)get32(g_lastReply + 24);
+}
+
+static int g_slept;
+
+static void on_sleep(uv_timer_t *t)
+{
+    (void)t;
+    g_slept = 1;
+}
+
+/* Run the loop for about ms milliseconds. */
+static void sleep_ms(uint64_t ms)
+{
+    uv_timer_t t;
+    g_slept = 0;
+    uv_timer_init(&g_loop, &t);
+    uv_timer_start(&t, on_sleep, ms, 0);
+    WAIT(g_slept);
+    uv_close((uv_handle_t *)&t, NULL);
+    uv_run(&g_loop, UV_RUN_NOWAIT);
+}
+
+/* One server statistic, for WAIT. */
+static uint64_t stat_of(oncRPCServer *s, size_t offset)
+{
+    oncRPCServerStats st;
+    oncRPCServerGetStats(s, &st);
+    if (offset == offsetof(oncRPCServerStats, connections) ||
+        offset == offsetof(oncRPCServerStats, duplicateCacheEntries))
+        return *(const size_t *)(const void *)((const char *)&st + offset);
+    return *(const uint64_t *)(const void *)((const char *)&st + offset);
+}
+#define STAT(s, field) stat_of((s), offsetof(oncRPCServerStats, field))
+
+static void duplicates(void)
+{
+    oncRPCServer *s = start_server(0);
+    oncRPCServerLimits lim;
+    oncRPCServerStats st;
+    struct sockaddr_in any;
+    uint16_t port;
+    int adds;
+
+    CHECK(s != NULL);
+    if (s == NULL)
+        return;
+    port = oncRPCServerPort(s, ONCRPC_PROTO_UDP);
+    uv_udp_init(&g_loop, &g_raw);
+    uv_ip4_addr("127.0.0.1", 0, &any);
+    CHECK(uv_udp_bind(&g_raw, (const struct sockaddr *)&any, 0) == 0);
+    CHECK(uv_udp_recv_start(&g_raw, raw_alloc, raw_recv) == 0);
+
+    oncRPCServerGetLimits(s, &lim);
+    CHECK(lim.duplicateCacheEntries == ONCRPC_DEFAULT_DRC_ENTRIES &&
+          lim.maxRecord == ONCRPC_DEFAULT_MAX_RECORD);
+
+    /* A resent request is answered from the cache with the same reply. */
+    g_replies = 0;
+    g_adds = 0;
+    raw_add(port, 1, 2, 3);
+    WAIT(g_replies == 1);
+    CHECK(last_sum(1) == 5 && g_adds == 1);
+    raw_add(port, 1, 2, 3);
+    WAIT(g_replies == 2);
+    CHECK(last_sum(1) == 5 && g_adds == 1);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.duplicatesReplayed == 1 && st.duplicateCacheEntries == 1 &&
+          st.duplicateCacheBytes == 28);
+
+    /* Same xid with different arguments, or a new xid: a new request. */
+    raw_add(port, 1, 2, 4);
+    WAIT(g_replies == 3);
+    CHECK(last_sum(1) == 6 && g_adds == 2);
+    raw_add(port, 2, 2, 3);
+    WAIT(g_replies == 4);
+    CHECK(last_sum(2) == 5 && g_adds == 3);
+
+    /* Resends of a request still being handled are ignored, then answered
+     * from the cache once the reply is sent. */
+    raw_add(port, 3, 1, -12345);
+    WAIT(g_nheld == 1);
+    raw_add(port, 3, 1, -12345);
+    raw_add(port, 3, 1, -12345);
+    WAIT(STAT(s, duplicatesDropped) == 2);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.duplicatesDropped == 2 && g_nheld == 1 && g_adds == 4 && g_replies == 4);
+    reply_held();
+    WAIT(g_replies == 5);
+    CHECK(last_sum(3) == -12344);
+    raw_add(port, 3, 1, -12345);
+    WAIT(g_replies == 6);
+    CHECK(last_sum(3) == -12344 && g_adds == 4 && g_nheld == 0);
+
+    /* A request dropped without a reply is forgotten: a resend runs again. */
+    raw_add(port, 4, 1, -12345);
+    WAIT(g_nheld == 1);
+    release_held();
+    raw_add(port, 4, 1, -12345);
+    WAIT(g_nheld == 1);
+    CHECK(g_adds == 6);
+    release_held();
+
+    /* Replies expire. */
+    lim.duplicateCacheTtlMs = 40;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.duplicateCacheEntries == 0);   /* emptied by the change */
+    adds = g_adds;
+    raw_add(port, 5, 7, 8);
+    WAIT(g_replies == 7);
+    WAIT(STAT(s, duplicateCacheEntries) == 0);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.duplicateCacheEntries == 0 && st.duplicateCacheBytes == 0);
+    raw_add(port, 5, 7, 8);
+    WAIT(g_replies == 8);
+    CHECK(last_sum(5) == 15 && g_adds == adds + 2);
+
+    /* At most duplicateCacheEntries replies are kept; the oldest goes. */
+    lim.duplicateCacheTtlMs = 0;   /* no expiry */
+    lim.duplicateCacheEntries = 2;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    adds = g_adds;
+    raw_add(port, 10, 1, 1);
+    WAIT(g_replies == 9);
+    raw_add(port, 11, 1, 1);
+    WAIT(g_replies == 10);
+    raw_add(port, 12, 1, 1);
+    WAIT(g_replies == 11);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.duplicateCacheEntries == 2 && g_adds == adds + 3);
+    raw_add(port, 12, 1, 1);           /* still cached */
+    WAIT(g_replies == 12);
+    CHECK(g_adds == adds + 3);
+    raw_add(port, 10, 1, 1);           /* evicted: runs again */
+    WAIT(g_replies == 13);
+    CHECK(g_adds == adds + 4);
+
+    /* ...and at most duplicateCacheBytes of them. */
+    lim.duplicateCacheEntries = 100;
+    lim.duplicateCacheBytes = 60;      /* two 28-byte replies */
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    raw_add(port, 20, 1, 1);
+    WAIT(g_replies == 14);
+    raw_add(port, 21, 1, 1);
+    WAIT(g_replies == 15);
+    raw_add(port, 22, 1, 1);
+    WAIT(g_replies == 16);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.duplicateCacheEntries == 2 && st.duplicateCacheBytes == 56);
+
+    /* Turned off, every resend runs again. */
+    lim.duplicateCacheEntries = 0;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    adds = g_adds;
+    raw_add(port, 30, 1, 1);
+    WAIT(g_replies == 17);
+    raw_add(port, 30, 1, 1);
+    WAIT(g_replies == 18);
+    CHECK(g_adds == adds + 2);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.duplicateCacheEntries == 0);
+
+    /* With maxRequests reached, new UDP requests are dropped. */
+    lim.maxRequests = 1;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    raw_add(port, 40, 1, -12345);
+    WAIT(g_nheld == 1);
+    raw_add(port, 41, 1, 1);
+    WAIT(STAT(s, requestsDroppedBusy) == 1);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.requestsDroppedBusy == 1 && g_replies == 18 && st.pendingRequests == 1);
+    reply_held();
+    WAIT(g_replies == 19);
+    raw_add(port, 41, 1, 1);
+    WAIT(g_replies == 20);
+    CHECK(last_sum(41) == 2);
+
+    lim.maxRecord = 0;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_ERR_INVALID);
+
+    uv_close((uv_handle_t *)&g_raw, NULL);
+    g_closed = 0;
+    oncRPCServerClose(s, on_closed, NULL);
+    run();
+    CHECK(g_closed == 1);
+}
+
+typedef struct lstate {
+    int     calls;
+    int     ok;
+    int32_t sum[4];
+} lstate;
+
+static void l_call(oncRPCClient *c, oncRPCStat st, void *res, void *data)
+{
+    lstate *l = (lstate *)data;
+    (void)c;
+    (void)res;
+    l->calls++;
+    l->ok += st == ONCRPC_OK;
+}
+
+static void limits(void)
+{
+    oncRPCServer *s = start_server(0);
+    oncRPCServerLimits lim;
+    oncRPCServerStats st;
+    oncRPCClient *c1, *c2;
+    lstate l;
+    uint16_t port;
+    int32_t x = 1, held = -12345, two = 2;
+    int i;
+
+    CHECK(s != NULL);
+    if (s == NULL)
+        return;
+    port = oncRPCServerPort(s, ONCRPC_PROTO_TCP);
+    oncRPCServerGetLimits(s, &lim);
+
+    /* maxConnections: the second connection is closed at once. */
+    lim.maxConnections = 1;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    memset(&l, 0, sizeof(l));
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, CALC_PROG, CALC_VERS,
+                             ONCRPC_PROTO_TCP, NULL, NULL, &c1) == ONCRPC_OK);
+    CHECK(calc_add_1(c1, &x, &two, &l.sum[0], l_call, &l) == ONCRPC_OK);
+    WAIT(l.calls == 1);
+    CHECK(l.ok == 1 && l.sum[0] == 3);
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, CALC_PROG, CALC_VERS,
+                             ONCRPC_PROTO_TCP, NULL, NULL, &c2) == ONCRPC_OK);
+    oncRPCClientSetTimeout(c2, 2000);
+    CHECK(calc_add_1(c2, &x, &two, &l.sum[1], l_call, &l) == ONCRPC_OK);
+    WAIT(l.calls == 2);
+    CHECK(l.ok == 1);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.connectionsRefused >= 1 && st.connections == 1 && st.connectionsAccepted == 1);
+    oncRPCClientClose(c2, NULL, NULL);
+
+    /* maxRequestsPerConnection: reading stops at the limit and resumes as
+     * requests finish; nothing is lost. */
+    lim.maxConnections = 0;
+    lim.maxRequestsPerConnection = 2;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    memset(&l, 0, sizeof(l));
+    g_adds = 0;
+    for (i = 0; i < 4; i++)
+        CHECK(calc_add_1(c1, &x, &held, &l.sum[i], l_call, &l) == ONCRPC_OK);
+    WAIT(g_nheld == 2 && STAT(s, connectionsPaused) >= 1);
+    sleep_ms(20);
+    oncRPCServerGetStats(s, &st);
+    CHECK(g_nheld == 2 && g_adds == 2 && st.pendingRequests == 2 && st.connectionsPaused >= 1);
+    reply_held();
+    WAIT(g_nheld == 2);
+    CHECK(g_adds == 4);
+    reply_held();
+    WAIT(l.calls == 4);
+    CHECK(l.ok == 4);
+    for (i = 0; i < 4; i++)
+        CHECK(l.sum[i] == -12344);
+
+    /* The global maxRequests pauses TCP connections too. */
+    lim.maxRequestsPerConnection = 0;
+    lim.maxRequests = 1;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    memset(&l, 0, sizeof(l));
+    g_adds = 0;
+    for (i = 0; i < 3; i++)
+        CHECK(calc_add_1(c1, &x, &held, &l.sum[i], l_call, &l) == ONCRPC_OK);
+    WAIT(g_nheld == 1);
+    sleep_ms(20);
+    CHECK(g_adds == 1);
+    /* Raising the limit lets the waiting requests in. */
+    lim.maxRequests = 0;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    WAIT(g_nheld == 3);
+    reply_held();
+    WAIT(l.calls == 3);
+    CHECK(l.ok == 3);
+
+    /* idleTimeoutMs: a quiet connection is closed; the client reconnects
+     * for its next call. */
+    lim.idleTimeoutMs = 40;
+    CHECK(oncRPCServerSetLimits(s, &lim) == ONCRPC_OK);
+    WAIT(STAT(s, connectionsIdleClosed) == 1);
+    sleep_ms(50);   /* let the client see the connection go */
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.connectionsIdleClosed == 1 && st.connections == 0);
+    memset(&l, 0, sizeof(l));
+    CHECK(calc_add_1(c1, &x, &two, &l.sum[0], l_call, &l) == ONCRPC_OK);
+    WAIT(l.calls == 1);
+    CHECK(l.ok == 1 && l.sum[0] == 3);
+
+    /* A connection with a request outstanding is not idle. */
+    memset(&l, 0, sizeof(l));
+    CHECK(calc_add_1(c1, &x, &held, &l.sum[0], l_call, &l) == ONCRPC_OK);
+    WAIT(g_nheld == 1);
+    sleep_ms(150);
+    oncRPCServerGetStats(s, &st);
+    CHECK(st.connections == 1);
+    reply_held();
+    WAIT(l.calls == 1);
+    CHECK(l.ok == 1);
+
+    oncRPCClientClose(c1, NULL, NULL);
+    g_closed = 0;
+    oncRPCServerClose(s, on_closed, NULL);
+    run();
+    CHECK(g_closed == 1);
+}
+
+/* ---- 5. Out-of-memory sweep -------------------------------------------------------- */
 
 typedef struct ostate {
     int           pending;     /* clients still open */
@@ -663,13 +1067,20 @@ int main(void)
     printf("  functional over UDP\n");
     functional(ONCRPC_PROTO_UDP, port);
     printf("  error reporting\n");
-    errors(port, deadport);
+    errors(s, port, deadport);
     oncRPCServerClose(s, NULL, NULL);
     run();
     CHECK(g_live == 0);
 
     printf("  lifecycle\n");
     lifecycle(port);
+    CHECK(g_live == 0);
+
+    printf("  duplicate-request cache\n");
+    duplicates();
+    CHECK(g_live == 0);
+    printf("  server limits\n");
+    limits();
     CHECK(g_live == 0);
 
     oom_sweep(0);

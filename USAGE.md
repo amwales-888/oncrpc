@@ -378,6 +378,59 @@ How servers behave:
   `oncRPCServerPending(srv)` tells how many are left.
 - **Lost connections.** If a TCP connection drops while a request is
   outstanding, the request stays valid; its reply is discarded.
+- **Resent UDP requests.** A UDP client that hears nothing resends its
+  request. The server remembers recent UDP requests and their replies (the
+  duplicate-request cache), so a resend does not run the procedure twice:
+  while the original is still being handled the resend is ignored, and once
+  it has been answered the resend gets the same reply again. A request
+  finished with `oncRPCSvcDrop` is forgotten, so a resend runs it afresh.
+  Resends are recognised by transaction id, caller address and the exact
+  request bytes. See "Server limits" below for sizing.
+- **Limits.** The server protects itself from busy or hostile clients with
+  limits on connections, outstanding requests and idle time; see below.
+
+### Server limits
+
+`oncRPCServerGetLimits` / `oncRPCServerSetLimits` read and change the
+limits at any time; `oncRPCServerGetStats` reports what they have done.
+For counts and times, 0 means "no limit".
+
+| Field | Default | Effect |
+|---|---|---|
+| `maxConnections` | 1024 | TCP connections open at once; further ones are accepted and closed at once |
+| `maxRequests` | 4096 | requests being handled at once over all transports; at the limit, TCP connections stop being read and new UDP requests are dropped (the clients resend) |
+| `maxRequestsPerConnection` | 64 | requests being handled at once for one TCP connection; at the limit, that connection stops being read |
+| `idleTimeoutMs` | 300000 | close TCP connections with no traffic and no outstanding request for this long |
+| `maxRecord` | 16 MiB | largest TCP request (must not be 0); `oncRPCServerSetMaxRecord` sets only this |
+| `duplicateCacheEntries` | 1024 | UDP requests remembered; 0 turns the cache off |
+| `duplicateCacheBytes` | 4 MiB | reply bytes kept; 0 = no byte limit |
+| `duplicateCacheTtlMs` | 120000 | how long a reply is kept; 0 = until evicted |
+
+```c
+oncRPCServerLimits lim;
+oncRPCServerGetLimits(server, &lim);
+lim.maxRequestsPerConnection = 8;     /* one slow client cannot hog us */
+lim.idleTimeoutMs = 60000;
+oncRPCServerSetLimits(server, &lim);
+```
+
+Notes:
+
+- A connection that stops being read is not lost: its data waits in the
+  kernel and the connection carries on as soon as requests finish (TCP flow
+  control slows the client down meanwhile). `connectionsPaused` counts these
+  pauses.
+- The cache is emptied when any of its three settings changes. Requests
+  still being handled are never evicted; when the cache holds nothing else,
+  new requests are simply not cached.
+- Keep `duplicateCacheTtlMs` longer than your clients' total timeout so
+  that late resends still find the reply.
+- An idle connection can be closed just as a client sends a new call on it;
+  that call fails with `ONCRPC_ERR_CANTRECV` and the client reconnects for
+  its next one. Choose an idle timeout well above the gaps between your
+  clients' calls.
+- The limits and the cache use the server's allocator and a housekeeping
+  timer that does not keep the loop alive by itself.
 
 ### Dispatch without generated code
 
@@ -499,6 +552,8 @@ checked once at the end. Use `ONCRPC_XDR_UNBOUNDED` as the maximum for `<>`.
 | `oncRPCServerPort(srv, proto)` | port actually bound |
 | `oncRPCServerRegister(srv, prog, vers, dispatch, ctx)` / `oncRPCServerUnregister` | serve a program version |
 | `oncRPCServerPmapRegister(srv, prog, vers, cb, data)` / `oncRPCServerPmapUnregister` | port mapper registration |
+| `oncRPCServerGetLimits(srv, &lim)` / `oncRPCServerSetLimits(srv, &lim)` | server limits and duplicate-request cache (section 7) |
+| `oncRPCServerGetStats(srv, &stats)` | counters: requests, duplicates, refused/idle/paused connections, cache use |
 | `oncRPCServerSetMaxRecord(srv, bytes)` | largest TCP request accepted (default 16 MiB) |
 | `oncRPCServerPending(srv)` / `oncRPCServerAllocator(srv)` | accessors |
 | `oncRPCSvcDecodeArgs(req, xargs, size)` | decode arguments (dispatch only) |
@@ -550,6 +605,10 @@ oncRPCXSpecFree(spec);
   other flavors with `AUTH_REJECTEDCRED`. Reply verifiers are AUTH_NONE.
 - **Transports.** TCP (RFC 5531 record marking; any number of fragments on
   receive, one per message on send) and UDP (64 KiB datagrams), IPv4 and IPv6.
+- **At-most-once over UDP.** The duplicate-request cache gives at-most-once
+  execution for resends that arrive while their entry is cached; a resend
+  arriving after the reply has been evicted or expired runs the procedure
+  again. Make procedures idempotent where that matters.
 - **Port mapper.** The client speaks protocol version 2 over UDP, which
   current `rpcbind` implementations support alongside versions 3 and 4.
 - **Hostile input.** Lengths are checked against declared bounds and the

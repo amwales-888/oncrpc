@@ -29,10 +29,36 @@ typedef struct sconn {
     size_t                  cap;
     struct sockaddr_storage peer;
     struct svcCall         *reqs;   /* outstanding requests from this connection */
+    size_t                  nreqs;
+    uint64_t                lastActive;   /* uv_now of the last traffic */
+    int                     paused;       /* reading stopped by a request limit */
     int                     closing;
     struct sconn           *next;
     struct sconn           *prev;
 } sconn;
+
+/*
+ * One remembered UDP request. While the request is being handled, req points
+ * at it and a resend is ignored; once answered, the reply is kept and a
+ * resend gets a copy. Entries live in a hash table (chained on hnext) and on
+ * a list ordered by last use, newest first, for expiry and eviction.
+ */
+typedef struct drcEntry {
+    struct drcEntry *hnext;
+    struct drcEntry *newer;
+    struct drcEntry *older;
+    slistener       *lis;
+    struct svcCall  *req;
+    uint8_t         *reply;      /* reply datagram once answered */
+    size_t           replylen;
+    size_t           reqlen;
+    uint64_t         stamp;      /* uv_now when answered */
+    uint32_t         xid;
+    uint32_t         bodyHash;   /* hash of the request after the xid */
+    uint32_t         bucket;
+    uint8_t          peerKey[20];
+    uint8_t          peerKeyLen;
+} drcEntry;
 
 typedef struct sreg {
     uint32_t         prog;
@@ -57,6 +83,7 @@ typedef struct svcCall {
     int                     inDispatch;
     int                     finished;
     oncRPCAuthSysParams     sys;
+    drcEntry               *drc;       /* UDP duplicate cache entry, if any */
     struct svcCall         *next;      /* in conn->reqs */
     struct svcCall         *prev;
 } svcCall;
@@ -77,18 +104,303 @@ struct oncRPCServer {
     slistener             *listeners;
     sconn                 *conns;
     sreg                  *regs;
-    size_t                 maxRecord;
+    oncRPCServerLimits     lim;
+    oncRPCServerStats      stats;
     size_t                 pendingReqs;   /* dispatched, not finished */
     size_t                 activeCloses;  /* uv_close callbacks outstanding */
     size_t                 activeOps;     /* writes/sends and port mapper ops */
+    size_t                 nconns;
+    size_t                 pausedConns;
     uint8_t               *msg;           /* reassembled TCP record */
     size_t                 msgcap;
+    uv_timer_t             tick;          /* idle connections, cache expiry */
+    uv_idle_t              resume;        /* restarts paused connections */
+    drcEntry             **drcTable;
+    uint32_t               drcBuckets;    /* power of two */
+    drcEntry              *drcNewest;
+    drcEntry              *drcOldest;
+    size_t                 drcEntries;
+    size_t                 drcBytes;
     int                    closing;
     oncRPCCloseCb          closeCb;
     void                  *closeData;
 };
 
 #define ONCRPC_REQ(r) ((svcCall *)(void *)(r))
+
+static void conn_close(sconn *c);
+static void on_resume(uv_idle_t *h);
+static void on_handle_closed(uv_handle_t *h);
+static void udp_send_copy(slistener *l, const struct sockaddr *to, const uint8_t *data,
+                          size_t len);
+
+/* ---- UDP duplicate-request cache ------------------------------------------------ */
+
+static uint32_t fnv1a(uint32_t h, const uint8_t *p, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* The bytes that identify a peer: family, port and address. */
+static uint8_t peer_key(const struct sockaddr *a, uint8_t key[20])
+{
+    if (a->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)(const void *)a;
+        key[0] = 6;
+        memcpy(key + 1, &a6->sin6_port, 2);
+        memcpy(key + 3, &a6->sin6_addr, 16);
+        return 19;
+    } else {
+        const struct sockaddr_in *a4 = (const struct sockaddr_in *)(const void *)a;
+        key[0] = 4;
+        memcpy(key + 1, &a4->sin_port, 2);
+        memcpy(key + 3, &a4->sin_addr, 4);
+        return 7;
+    }
+}
+
+static int drc_enabled(const oncRPCServer *s)
+{
+    return s->lim.duplicateCacheEntries > 0 && !s->closing;
+}
+
+static void drc_unlink_age(oncRPCServer *s, drcEntry *e)
+{
+    if (e->newer)
+        e->newer->older = e->older;
+    else
+        s->drcNewest = e->older;
+    if (e->older)
+        e->older->newer = e->newer;
+    else
+        s->drcOldest = e->newer;
+    e->newer = e->older = NULL;
+}
+
+static void drc_push_newest(oncRPCServer *s, drcEntry *e)
+{
+    e->older = s->drcNewest;
+    e->newer = NULL;
+    if (s->drcNewest)
+        s->drcNewest->newer = e;
+    else
+        s->drcOldest = e;
+    s->drcNewest = e;
+}
+
+static void drc_remove(oncRPCServer *s, drcEntry *e)
+{
+    drcEntry **pp = &s->drcTable[e->bucket];
+    while (*pp != e)
+        pp = &(*pp)->hnext;
+    *pp = e->hnext;
+    drc_unlink_age(s, e);
+    if (e->req != NULL)
+        e->req->drc = NULL;
+    s->drcEntries--;
+    s->drcBytes -= e->replylen;
+    oncRPCFree(s->alloc, e->reply);
+    oncRPCFree(s->alloc, e);
+}
+
+static void drc_clear(oncRPCServer *s)
+{
+    while (s->drcOldest != NULL)
+        drc_remove(s, s->drcOldest);
+    oncRPCFree(s->alloc, s->drcTable);
+    s->drcTable = NULL;
+    s->drcBuckets = 0;
+}
+
+static int drc_expired(const oncRPCServer *s, const drcEntry *e, uint64_t now)
+{
+    return e->req == NULL && s->lim.duplicateCacheTtlMs > 0 &&
+           now - e->stamp >= s->lim.duplicateCacheTtlMs;
+}
+
+/* Drop answered entries that have expired. Answered entries are ordered by
+ * the time of their reply, so the walk stops at the first live one. */
+static void drc_expire(oncRPCServer *s, uint64_t now)
+{
+    drcEntry *e = s->drcOldest;
+    while (e != NULL) {
+        drcEntry *newer = e->newer;
+        if (e->req == NULL) {
+            if (!drc_expired(s, e, now))
+                break;
+            drc_remove(s, e);
+        }
+        e = newer;
+    }
+}
+
+/* Evict the oldest answered entries until one more entry with extra reply
+ * bytes fits. Entries still being handled are never evicted. Returns 0 if
+ * there is no room. */
+static int drc_make_room(oncRPCServer *s, size_t entries, size_t bytes, const drcEntry *keep)
+{
+    drcEntry *e = s->drcOldest;
+    const size_t maxBytes = s->lim.duplicateCacheBytes;
+
+    if (maxBytes > 0 && bytes > maxBytes)
+        return 0;
+    while (s->drcEntries + entries > s->lim.duplicateCacheEntries ||
+           (maxBytes > 0 && s->drcBytes + bytes > maxBytes)) {
+        while (e != NULL && (e->req != NULL || e == keep))
+            e = e->newer;
+        if (e == NULL)
+            return 0;
+        {
+            drcEntry *newer = e->newer;
+            drc_remove(s, e);
+            e = newer;
+        }
+    }
+    return 1;
+}
+
+static uint32_t drc_bucket(const oncRPCServer *s, uint32_t xid, const uint8_t *key, size_t keylen)
+{
+    uint8_t x[4];
+    oncRPCIntPutBe32(x, xid);
+    return fnv1a(fnv1a(2166136261u, x, 4), key, keylen) & (s->drcBuckets - 1);
+}
+
+static drcEntry *drc_find(oncRPCServer *s, const slistener *l, uint32_t xid, uint32_t bodyHash,
+                          size_t reqlen, const uint8_t *key, uint8_t keylen)
+{
+    drcEntry *e;
+    if (s->drcTable == NULL)
+        return NULL;
+    for (e = s->drcTable[drc_bucket(s, xid, key, keylen)]; e != NULL; e = e->hnext)
+        if (e->xid == xid && e->lis == l && e->bodyHash == bodyHash && e->reqlen == reqlen &&
+            e->peerKeyLen == keylen && memcmp(e->peerKey, key, keylen) == 0)
+            return e;
+    return NULL;
+}
+
+static drcEntry *drc_insert(oncRPCServer *s, slistener *l, uint32_t xid, uint32_t bodyHash,
+                            size_t reqlen, const uint8_t *key, uint8_t keylen)
+{
+    drcEntry *e;
+
+    if (s->drcTable == NULL) {
+        uint32_t n = 16;
+        while (n < s->lim.duplicateCacheEntries && n < 65536u)
+            n <<= 1;
+        s->drcTable = (drcEntry **)oncRPCAllocArray(s->alloc, n, sizeof(drcEntry *));
+        if (s->drcTable == NULL)
+            return NULL;
+        s->drcBuckets = n;
+    }
+    if (!drc_make_room(s, 1, 0, NULL))
+        return NULL;
+    e = (drcEntry *)oncRPCAlloc(s->alloc, sizeof(*e));
+    if (e == NULL)
+        return NULL;
+    e->lis = l;
+    e->xid = xid;
+    e->bodyHash = bodyHash;
+    e->reqlen = reqlen;
+    memcpy(e->peerKey, key, keylen);
+    e->peerKeyLen = keylen;
+    e->bucket = drc_bucket(s, xid, key, keylen);
+    e->hnext = s->drcTable[e->bucket];
+    s->drcTable[e->bucket] = e;
+    drc_push_newest(s, e);
+    s->drcEntries++;
+    return e;
+}
+
+/* The request behind e has been answered with this datagram: keep a copy. */
+static void drc_answered(oncRPCServer *s, drcEntry *e, const uint8_t *reply, size_t len)
+{
+    e->req->drc = NULL;
+    e->req = NULL;
+    if (!drc_make_room(s, 0, len, e) ||
+        (e->reply = (uint8_t *)oncRPCRealloc(s->alloc, NULL, len)) == NULL) {
+        drc_remove(s, e);
+        return;
+    }
+    memcpy(e->reply, reply, len);
+    e->replylen = len;
+    s->drcBytes += len;
+    e->stamp = uv_now(s->loop);
+    drc_unlink_age(s, e);
+    drc_push_newest(s, e);
+}
+
+/*
+ * Look a UDP datagram up in the cache. Returns 1 if it was a resend that has
+ * been dealt with; otherwise 0, with *entry set to a new in-progress entry
+ * for it (or NULL if it is not cached).
+ */
+static int drc_check(slistener *l, const uint8_t *msg, size_t len, const struct sockaddr *from,
+                     drcEntry **entry)
+{
+    oncRPCServer *s = l->srv;
+    uint8_t key[20];
+    uint8_t keylen;
+    uint32_t xid, bodyHash;
+    drcEntry *e;
+
+    *entry = NULL;
+    if (!drc_enabled(s) || len < 8 || oncRPCIntGetBe32(msg + 4) != ONCRPC_MSG_CALL)
+        return 0;
+    xid = oncRPCIntGetBe32(msg);
+    bodyHash = fnv1a(2166136261u, msg + 4, len - 4);
+    keylen = peer_key(from, key);
+    e = drc_find(s, l, xid, bodyHash, len, key, keylen);
+    if (e != NULL) {
+        if (e->req != NULL) {
+            s->stats.duplicatesDropped++;
+            return 1;
+        }
+        if (!drc_expired(s, e, uv_now(s->loop))) {
+            s->stats.duplicatesReplayed++;
+            udp_send_copy(l, from, e->reply, e->replylen);
+            return 1;
+        }
+        drc_remove(s, e);
+    }
+    *entry = drc_insert(s, l, xid, bodyHash, len, key, keylen);
+    return 0;
+}
+
+/* ---- Connection pausing -------------------------------------------------------- */
+
+static int conn_may_dispatch(const sconn *c)
+{
+    const oncRPCServer *s = c->srv;
+    return (s->lim.maxRequestsPerConnection == 0 ||
+            c->nreqs < s->lim.maxRequestsPerConnection) &&
+           (s->lim.maxRequests == 0 || s->pendingReqs < s->lim.maxRequests);
+}
+
+static void conn_pause(sconn *c)
+{
+    oncRPCServer *s = c->srv;
+    if (c->paused)
+        return;
+    c->paused = 1;
+    s->pausedConns++;
+    s->stats.connectionsPaused++;
+    (void)uv_read_stop((uv_stream_t *)&c->tcp);
+}
+
+/* Paused connections are restarted from an idle callback rather than from
+ * inside oncRPCSvcReply and friends, so that a reply never dispatches new
+ * requests from within the caller. */
+static void schedule_resume(oncRPCServer *s)
+{
+    if (s->pausedConns > 0 && !s->closing)
+        (void)uv_idle_start(&s->resume, on_resume);
+}
 
 /* ---- Close bookkeeping ------------------------------------------------------- */
 
@@ -122,16 +434,22 @@ static void release(svcCall *r)
         oncRPCXdrFree(s->alloc, r->xargs, r->args);
         oncRPCFree(s->alloc, r->args);
     }
+    if (r->drc != NULL)   /* finished without a reply: forget the request */
+        drc_remove(s, r->drc);
     if (r->conn != NULL) {
+        sconn *c = r->conn;
         if (r->prev)
             r->prev->next = r->next;
         else
-            r->conn->reqs = r->next;
+            c->reqs = r->next;
         if (r->next)
             r->next->prev = r->prev;
+        c->nreqs--;
+        c->lastActive = uv_now(s->loop);
     }
     oncRPCFree(s->alloc, r);
     s->pendingReqs--;
+    schedule_resume(s);
     maybe_finish_close(s);
 }
 
@@ -178,6 +496,8 @@ static void transmit(svcCall *r, uint8_t *buf, size_t len)
     }
     w->srv = s;
     w->buf = buf;
+    if (r->drc != NULL)
+        drc_answered(s, r->drc, buf + 4, len - 4);
     if (r->pub.proto == ONCRPC_PROTO_TCP) {
         oncRPCIntPutBe32(buf, (uint32_t)(len - 4) | ONCRPC_LAST_FRAGMENT);
         b = uv_buf_init((char *)buf, (unsigned int)len);
@@ -189,6 +509,32 @@ static void transmit(svcCall *r, uint8_t *buf, size_t len)
     }
     if (rc != 0) {
         oncRPCFree(s->alloc, buf);
+        oncRPCFree(s->alloc, w);
+        return;
+    }
+    s->activeOps++;
+}
+
+/* Send a copy of a datagram (a cached reply). */
+static void udp_send_copy(slistener *l, const struct sockaddr *to, const uint8_t *data,
+                          size_t len)
+{
+    oncRPCServer *s = l->srv;
+    swreq *w = (swreq *)oncRPCAlloc(s->alloc, sizeof(*w));
+    uv_buf_t b;
+
+    if (w == NULL)
+        return;
+    w->srv = s;
+    w->buf = (uint8_t *)oncRPCRealloc(s->alloc, NULL, len);
+    if (w->buf == NULL) {
+        oncRPCFree(s->alloc, w);
+        return;
+    }
+    memcpy(w->buf, data, len);
+    b = uv_buf_init((char *)w->buf, (unsigned int)len);
+    if (uv_udp_send(&w->r.u, &l->io.udp, &b, 1, to, on_sent) != 0) {
+        oncRPCFree(s->alloc, w->buf);
         oncRPCFree(s->alloc, w);
         return;
     }
@@ -374,8 +720,10 @@ int oncRPCSvcPeer(const oncRPCSvcReq *req, char *buf, size_t len)
 
 /* ---- Incoming calls -------------------------------------------------------------- */
 
-static void handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCProto proto,
-                        sconn *conn, slistener *lis, const struct sockaddr_storage *peer)
+/* Returns 1 if a request was created (it may already be finished). */
+static int handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCProto proto,
+                       sconn *conn, slistener *lis, const struct sockaddr_storage *peer,
+                       drcEntry *drc)
 {
     svcCall *r;
     oncRPCXdr x;
@@ -385,16 +733,16 @@ static void handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCP
     int found_prog = 0;
 
     if (s->closing)
-        return;
+        return 0;
     oncRPCXdrInitDecode(&x, s->alloc, msg, len);
     {
         uint32_t xid;
         if (!oncRPCXdrUint32(&x, &xid) || !oncRPCXdrUint32(&x, &mtype) ||
             mtype != ONCRPC_MSG_CALL || !oncRPCXdrUint32(&x, &rpcvers))
-            return;   /* not a call: ignore silently */
+            return 0;   /* not a call: ignore silently */
         r = (svcCall *)oncRPCAlloc(s->alloc, sizeof(*r));
         if (r == NULL)
-            return;   /* no memory: the client will retry or time out */
+            return 0;   /* no memory: the client will retry or time out */
         r->pub.xid = xid;
     }
     r->srv = s;
@@ -409,19 +757,25 @@ static void handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCP
         if (conn->reqs)
             conn->reqs->prev = r;
         conn->reqs = r;
+        conn->nreqs++;
+    }
+    if (drc != NULL) {
+        r->drc = drc;
+        drc->req = r;
     }
     s->pendingReqs++;
+    s->stats.requests++;
 
     if (rpcvers != ONCRPC_PROTOCOL_VERSION) {
         reply_denied(r, ONCRPC_REJ_RPC_MISMATCH, ONCRPC_PROTOCOL_VERSION,
                      ONCRPC_PROTOCOL_VERSION);
-        return;
+        return 1;
     }
     if (!oncRPCXdrUint32(&x, &r->pub.prog) || !oncRPCXdrUint32(&x, &r->pub.vers) ||
         !oncRPCXdrUint32(&x, &r->pub.proc) || !oncRPCIntXdrOpaqueAuth(&x, &cred) ||
         !oncRPCIntXdrOpaqueAuth(&x, &verf)) {
         reply_accepted(r, ONCRPC_ACCEPT_GARBAGE_ARGS, 0, 0);
-        return;
+        return 1;
     }
     r->pub.credFlavor = cred.flavor;
     if (cred.flavor == ONCRPC_AUTH_SYS) {
@@ -429,12 +783,12 @@ static void handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCP
         oncRPCXdrInitDecode(&ax, NULL, cred.body, cred.len);
         if (!oncRPCXdrAuthSys(&ax, &r->sys)) {
             reply_denied(r, ONCRPC_REJ_AUTH_ERROR, ONCRPC_AUTH_BADCRED, 0);
-            return;
+            return 1;
         }
         r->pub.authSys = &r->sys;
     } else if (cred.flavor != ONCRPC_AUTH_NONE) {
         reply_denied(r, ONCRPC_REJ_AUTH_ERROR, ONCRPC_AUTH_REJECTEDCRED, 0);
-        return;
+        return 1;
     }
 
     for (g = s->regs; g != NULL; g = g->next) {
@@ -453,7 +807,7 @@ static void handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCP
             reply_accepted(r, ONCRPC_ACCEPT_PROG_MISMATCH, low, high);
         else
             reply_accepted(r, ONCRPC_ACCEPT_PROG_UNAVAIL, 0, 0);
-        return;
+        return 1;
     }
 
     r->pub.ctx = match->ctx;
@@ -466,6 +820,7 @@ static void handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCP
     r->msg = NULL;
     if (r->finished)
         release(r);
+    return 1;
 }
 
 static void on_conn_closed(uv_handle_t *h)
@@ -486,6 +841,11 @@ static void conn_close(sconn *c)
     if (c->closing)
         return;
     c->closing = 1;
+    if (c->paused) {
+        c->paused = 0;
+        s->pausedConns--;
+    }
+    s->nconns--;
     /* Outstanding requests survive; their replies will be discarded. */
     for (r = c->reqs; r != NULL; r = r->next)
         r->conn = NULL;
@@ -506,7 +866,7 @@ static void on_conn_alloc(uv_handle_t *h, size_t suggested, uv_buf_t *b)
     oncRPCServer *s = c->srv;
     (void)suggested;
     if (c->cap - c->len < ONCRPC_READ_CHUNK &&
-        (c->len > s->maxRecord + ONCRPC_READ_CHUNK ||
+        (c->len > s->lim.maxRecord + ONCRPC_READ_CHUNK ||
          !oncRPCIntGrow(s->alloc, &c->buf, &c->cap, c->len + ONCRPC_READ_CHUNK))) {
         *b = uv_buf_init(NULL, 0);   /* reported as UV_ENOBUFS: connection dropped */
         return;
@@ -514,27 +874,63 @@ static void on_conn_alloc(uv_handle_t *h, size_t suggested, uv_buf_t *b)
     *b = uv_buf_init((char *)c->buf + c->len, (unsigned int)(c->cap - c->len));
 }
 
-static void on_conn_read(uv_stream_t *st, ssize_t nread, const uv_buf_t *b)
+/* Dispatch the complete records buffered for a connection, pausing it when a
+ * request limit is reached. */
+static void conn_process(sconn *c)
 {
-    sconn *c = (sconn *)st->data;
     oncRPCServer *s = c->srv;
     size_t mlen;
     int r;
+
+    while (!c->closing && !s->closing) {
+        if (!conn_may_dispatch(c)) {
+            conn_pause(c);
+            return;
+        }
+        r = oncRPCIntRecordExtract(s->alloc, c->buf, &c->len, s->lim.maxRecord, &s->msg,
+                                   &s->msgcap, &mlen);
+        if (r == 0)
+            return;
+        if (r < 0) {
+            conn_close(c);
+            return;
+        }
+        (void)handle_call(s, s->msg, mlen, ONCRPC_PROTO_TCP, c, NULL, &c->peer, NULL);
+    }
+}
+
+static void on_conn_read(uv_stream_t *st, ssize_t nread, const uv_buf_t *b)
+{
+    sconn *c = (sconn *)st->data;
     (void)b;
 
     if (nread < 0) {
         conn_close(c);
         return;
     }
+    if (nread == 0)
+        return;
     c->len += (size_t)nread;
-    while (!c->closing && !s->closing &&
-           (r = oncRPCIntRecordExtract(s->alloc, c->buf, &c->len, s->maxRecord, &s->msg,
-                                       &s->msgcap, &mlen)) != 0) {
-        if (r < 0) {
+    c->lastActive = uv_now(c->srv->loop);
+    conn_process(c);
+}
+
+static void on_resume(uv_idle_t *h)
+{
+    oncRPCServer *s = (oncRPCServer *)h->data;
+    sconn *c, *next;
+
+    (void)uv_idle_stop(h);
+    for (c = s->conns; c != NULL && !s->closing && s->pausedConns > 0; c = next) {
+        next = c->next;
+        if (!c->paused || !conn_may_dispatch(c))
+            continue;
+        c->paused = 0;
+        s->pausedConns--;
+        conn_process(c);
+        if (!c->closing && !c->paused &&
+            uv_read_start((uv_stream_t *)&c->tcp, on_conn_alloc, on_conn_read) != 0)
             conn_close(c);
-            return;
-        }
-        handle_call(s, s->msg, mlen, ONCRPC_PROTO_TCP, c, NULL, &c->peer);
     }
 }
 
@@ -555,14 +951,22 @@ static void on_connection(uv_stream_t *server, int status)
     }
     c->srv = s;
     c->tcp.data = c;
+    c->lastActive = uv_now(s->loop);
     c->next = s->conns;
     if (s->conns)
         s->conns->prev = c;
     s->conns = c;
+    s->nconns++;
     if (uv_accept(server, (uv_stream_t *)&c->tcp) != 0) {
         conn_close(c);
         return;
     }
+    if (s->lim.maxConnections > 0 && s->nconns > s->lim.maxConnections) {
+        s->stats.connectionsRefused++;
+        conn_close(c);
+        return;
+    }
+    s->stats.connectionsAccepted++;
     (void)uv_tcp_nodelay(&c->tcp, 1);
     (void)uv_tcp_getpeername(&c->tcp, (struct sockaddr *)&c->peer, &len);
     if (uv_read_start((uv_stream_t *)&c->tcp, on_conn_alloc, on_conn_read) != 0)
@@ -580,15 +984,70 @@ static void on_udp_recv(uv_udp_t *u, ssize_t nread, const uv_buf_t *b,
                         const struct sockaddr *addr, unsigned flags)
 {
     slistener *l = (slistener *)u->data;
+    oncRPCServer *s = l->srv;
+    const uint8_t *msg = (const uint8_t *)b->base;
     struct sockaddr_storage peer;
+    drcEntry *drc;
 
-    if (nread <= 0 || addr == NULL || (flags & UV_UDP_PARTIAL))
+    if (nread <= 0 || addr == NULL || (flags & UV_UDP_PARTIAL) || s->closing)
         return;
+    if (drc_check(l, msg, (size_t)nread, addr, &drc))
+        return;   /* a resend, answered from the cache or still in hand */
+    if (s->lim.maxRequests > 0 && s->pendingReqs >= s->lim.maxRequests) {
+        s->stats.requestsDroppedBusy++;
+        if (drc != NULL)
+            drc_remove(s, drc);
+        return;
+    }
     memset(&peer, 0, sizeof(peer));
     memcpy(&peer, addr, addr->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6)
                                                     : sizeof(struct sockaddr_in));
-    handle_call(l->srv, (const uint8_t *)b->base, (size_t)nread, ONCRPC_PROTO_UDP, NULL, l,
-                &peer);
+    if (!handle_call(s, msg, (size_t)nread, ONCRPC_PROTO_UDP, NULL, l, &peer, drc) &&
+        drc != NULL)
+        drc_remove(s, drc);
+}
+
+/* Periodic housekeeping: close idle connections and expire cached replies. */
+static void on_tick(uv_timer_t *t)
+{
+    oncRPCServer *s = (oncRPCServer *)t->data;
+    uint64_t now = uv_now(s->loop);
+    sconn *c, *next;
+
+    if (s->closing)
+        return;
+    if (s->lim.idleTimeoutMs > 0) {
+        for (c = s->conns; c != NULL; c = next) {
+            next = c->next;
+            if (c->nreqs == 0 && !c->paused && now - c->lastActive >= s->lim.idleTimeoutMs) {
+                s->stats.connectionsIdleClosed++;
+                conn_close(c);
+            }
+        }
+    }
+    drc_expire(s, now);
+}
+
+/* Run the housekeeping timer often enough for the shortest time limit. */
+static void restart_tick(oncRPCServer *s)
+{
+    uint64_t period = 0;
+    uint32_t t[2];
+    int i;
+
+    t[0] = s->lim.idleTimeoutMs;
+    t[1] = s->lim.duplicateCacheEntries > 0 ? s->lim.duplicateCacheTtlMs : 0;
+    for (i = 0; i < 2; i++)
+        if (t[i] > 0 && (period == 0 || t[i] / 4 < period))
+            period = t[i] / 4;
+    (void)uv_timer_stop(&s->tick);
+    if (period == 0 || s->closing)
+        return;
+    if (period < 10)
+        period = 10;
+    if (period > 1000)
+        period = 1000;
+    (void)uv_timer_start(&s->tick, on_tick, period, period);
 }
 
 /* ---- Server object ------------------------------------------------------------------- */
@@ -606,9 +1065,40 @@ oncRPCStat oncRPCServerCreate(uv_loop_t *loop, const oncRPCAllocator *alloc, onc
         return ONCRPC_ERR_NOMEM;
     s->loop = loop;
     s->alloc = alloc;
-    s->maxRecord = ONCRPC_DEFAULT_MAX_RECORD;
+    s->lim.maxConnections = ONCRPC_DEFAULT_MAX_CONNECTIONS;
+    s->lim.maxRequests = ONCRPC_DEFAULT_MAX_REQUESTS;
+    s->lim.maxRequestsPerConnection = ONCRPC_DEFAULT_MAX_REQUESTS_PER_CONNECTION;
+    s->lim.idleTimeoutMs = ONCRPC_DEFAULT_IDLE_TIMEOUT_MS;
+    s->lim.maxRecord = ONCRPC_DEFAULT_MAX_RECORD;
+    s->lim.duplicateCacheEntries = ONCRPC_DEFAULT_DRC_ENTRIES;
+    s->lim.duplicateCacheBytes = ONCRPC_DEFAULT_DRC_BYTES;
+    s->lim.duplicateCacheTtlMs = ONCRPC_DEFAULT_DRC_TTL_MS;
+    if (uv_timer_init(loop, &s->tick) != 0) {
+        oncRPCFree(alloc, s);
+        return ONCRPC_ERR_FAILED;
+    }
+    if (uv_idle_init(loop, &s->resume) != 0) {
+        /* The timer must still be closed before the memory goes. */
+        s->closing = 1;
+        s->tick.data = s;
+        s->activeCloses = 1;
+        uv_close((uv_handle_t *)&s->tick, on_handle_closed);
+        return ONCRPC_ERR_FAILED;
+    }
+    s->tick.data = s;
+    s->resume.data = s;
+    /* Housekeeping alone must not keep the loop running. */
+    uv_unref((uv_handle_t *)&s->tick);
+    restart_tick(s);
     *out = s;
     return ONCRPC_OK;
+}
+
+static void on_handle_closed(uv_handle_t *h)
+{
+    oncRPCServer *s = (oncRPCServer *)h->data;
+    s->activeCloses--;
+    maybe_finish_close(s);
 }
 
 static void on_listener_closed(uv_handle_t *h)
@@ -628,6 +1118,10 @@ void oncRPCServerClose(oncRPCServer *s, oncRPCCloseCb cb, void *data)
     s->closing = 1;
     s->closeCb = cb;
     s->closeData = data;
+    drc_clear(s);
+    s->activeCloses += 2;
+    uv_close((uv_handle_t *)&s->tick, on_handle_closed);
+    uv_close((uv_handle_t *)&s->resume, on_handle_closed);
     while (s->listeners != NULL) {
         slistener *l = s->listeners;
         s->listeners = l->next;
@@ -761,7 +1255,38 @@ oncRPCStat oncRPCServerUnregister(oncRPCServer *s, uint32_t prog, uint32_t vers)
 void oncRPCServerSetMaxRecord(oncRPCServer *s, size_t bytes)
 {
     if (s != NULL && bytes > 0)
-        s->maxRecord = bytes;
+        s->lim.maxRecord = bytes;
+}
+
+void oncRPCServerGetLimits(const oncRPCServer *s, oncRPCServerLimits *limits)
+{
+    if (s != NULL && limits != NULL)
+        *limits = s->lim;
+}
+
+oncRPCStat oncRPCServerSetLimits(oncRPCServer *s, const oncRPCServerLimits *limits)
+{
+    if (s == NULL || limits == NULL || s->closing || limits->maxRecord == 0)
+        return ONCRPC_ERR_INVALID;
+    if (limits->duplicateCacheEntries != s->lim.duplicateCacheEntries ||
+        limits->duplicateCacheBytes != s->lim.duplicateCacheBytes ||
+        limits->duplicateCacheTtlMs != s->lim.duplicateCacheTtlMs)
+        drc_clear(s);
+    s->lim = *limits;
+    restart_tick(s);
+    schedule_resume(s);   /* raised request limits may free paused connections */
+    return ONCRPC_OK;
+}
+
+void oncRPCServerGetStats(const oncRPCServer *s, oncRPCServerStats *stats)
+{
+    if (s == NULL || stats == NULL)
+        return;
+    *stats = s->stats;
+    stats->connections = s->nconns;
+    stats->pendingRequests = s->pendingReqs;
+    stats->duplicateCacheEntries = s->drcEntries;
+    stats->duplicateCacheBytes = s->drcBytes;
 }
 
 size_t oncRPCServerPending(const oncRPCServer *s)

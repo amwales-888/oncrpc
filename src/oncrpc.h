@@ -42,6 +42,15 @@ extern "C" {
 #define ONCRPC_DEFAULT_MAX_RECORD (16u * 1024u * 1024u)
 #define ONCRPC_DEFAULT_TIMEOUT_MS 25000u
 #define ONCRPC_DEFAULT_RETRY_MS   1000u
+
+/* Server limit defaults (see oncRPCServerLimits). */
+#define ONCRPC_DEFAULT_MAX_CONNECTIONS      1024u
+#define ONCRPC_DEFAULT_MAX_REQUESTS         4096u
+#define ONCRPC_DEFAULT_MAX_REQUESTS_PER_CONNECTION 64u
+#define ONCRPC_DEFAULT_IDLE_TIMEOUT_MS      300000u
+#define ONCRPC_DEFAULT_DRC_ENTRIES          1024u
+#define ONCRPC_DEFAULT_DRC_BYTES            (4u * 1024u * 1024u)
+#define ONCRPC_DEFAULT_DRC_TTL_MS           120000u
 #define ONCRPC_UDP_MAX            65536u
 
 /* Port mapper (RFC 1833, version 2) */
@@ -275,7 +284,64 @@ ONCRPC_API oncRPCStat oncRPCServerPmapRegister(oncRPCServer *srv, uint32_t prog,
 ONCRPC_API oncRPCStat oncRPCServerPmapUnregister(oncRPCServer *srv, uint32_t prog,
                                                  uint32_t vers, oncRPCServerPmapCb cb,
                                                  void *data);
-/* Largest TCP request record accepted (default ONCRPC_DEFAULT_MAX_RECORD). */
+/*
+ * Limits that protect a server from busy or hostile clients. For the count
+ * and time limits, 0 means "no limit". Defaults are the ONCRPC_DEFAULT_*
+ * values above.
+ */
+typedef struct oncRPCServerLimits {
+    /* TCP connections open at once; further connections are closed as
+     * soon as they are accepted. */
+    size_t   maxConnections;
+    /* Requests being handled at once (dispatched, not yet finished), over
+     * all transports. When reached, TCP connections stop being read and new
+     * UDP requests are dropped (the clients retransmit). */
+    size_t   maxRequests;
+    /* Requests being handled at once for one TCP connection; when reached,
+     * that connection stops being read until one is finished. */
+    size_t   maxRequestsPerConnection;
+    /* Close TCP connections that have had no traffic and no outstanding
+     * request for this long. */
+    uint32_t idleTimeoutMs;
+    /* Largest TCP request record accepted (must not be 0). */
+    size_t   maxRecord;
+    /*
+     * UDP duplicate-request cache. A UDP client that receives no reply
+     * resends its request; without the cache the procedure would run again.
+     * With it, a resent request is ignored while the original is still being
+     * handled, and answered with the original reply once there is one. Up to
+     * duplicateCacheEntries requests and duplicateCacheBytes of replies are
+     * remembered, each for duplicateCacheTtlMs after its reply; the oldest
+     * replies make way for new ones. duplicateCacheEntries 0 turns the cache
+     * off; duplicateCacheBytes 0 or duplicateCacheTtlMs 0 removes that limit.
+     */
+    size_t   duplicateCacheEntries;
+    size_t   duplicateCacheBytes;
+    uint32_t duplicateCacheTtlMs;
+} oncRPCServerLimits;
+
+/* What a server has done, for monitoring and tests. */
+typedef struct oncRPCServerStats {
+    uint64_t requests;               /* requests received (not counting duplicates) */
+    uint64_t duplicatesReplayed;     /* UDP resends answered from the cache */
+    uint64_t duplicatesDropped;      /* UDP resends of requests still being handled */
+    uint64_t requestsDroppedBusy;    /* UDP requests dropped at maxRequests */
+    uint64_t connectionsAccepted;
+    uint64_t connectionsRefused;     /* closed at once because of maxConnections */
+    uint64_t connectionsIdleClosed;  /* closed by idleTimeoutMs */
+    uint64_t connectionsPaused;      /* times a connection stopped being read */
+    size_t   connections;            /* open now */
+    size_t   pendingRequests;        /* being handled now */
+    size_t   duplicateCacheEntries;  /* in the cache now */
+    size_t   duplicateCacheBytes;
+} oncRPCServerStats;
+
+/* Read or change the limits; changes apply at once. The duplicate cache is
+ * emptied when its size or lifetime changes. */
+ONCRPC_API void       oncRPCServerGetLimits(const oncRPCServer *srv, oncRPCServerLimits *limits);
+ONCRPC_API oncRPCStat oncRPCServerSetLimits(oncRPCServer *srv, const oncRPCServerLimits *limits);
+ONCRPC_API void       oncRPCServerGetStats(const oncRPCServer *srv, oncRPCServerStats *stats);
+/* Same as setting limits.maxRecord. */
 ONCRPC_API void oncRPCServerSetMaxRecord(oncRPCServer *srv, size_t bytes);
 /* Number of requests handed to dispatch routines and not yet finished. */
 ONCRPC_API size_t oncRPCServerPending(const oncRPCServer *srv);

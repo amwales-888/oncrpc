@@ -3,7 +3,8 @@
 liboncrpc is a clean-room C99 implementation of:
 
 - **XDR**: External Data Representation, RFC 4506
-- **ONC RPC version 2**: RFC 5531, over TCP (record marking) and UDP
+- **ONC RPC version 2**: RFC 5531, over TCP (record marking), UDP and
+  local sockets (Unix domain sockets; named pipes on Windows)
 - **rpcbind versions 3 and 4, port mapper version 2**: RFC 1833 (lookup
   and registration, IPv4 and IPv6)
 - **The XDR/RPC language**: `.x` files, with a parser and the `oncrpcgen`
@@ -468,6 +469,49 @@ Notes:
 - The limits and the cache use the server's allocator and a housekeeping
   timer that does not keep the loop alive by itself.
 
+### Local sockets
+
+`ONCRPC_PROTO_LOCAL` carries calls over a Unix domain socket (a named pipe
+on Windows) between programs on the same machine. Where TCP and UDP take
+an address and a port, it takes a path:
+
+```c
+/* server */
+oncRPCServerListen(server, ONCRPC_PROTO_LOCAL, "/run/myapp/rpc.sock", 0);
+
+/* client: the "host" is the path; the port is not used */
+oncRPCClientCreate(loop, &app_alloc, "/run/myapp/rpc.sock", 0, MY_PROG, MY_VERS,
+                   ONCRPC_PROTO_LOCAL, NULL, NULL, &client);
+```
+
+On Windows the path is a pipe name such as `\\.\pipe\myapp` (written
+`"\\\\.\\pipe\\myapp"` in C).
+
+- **Same as TCP otherwise.** Messages are framed as over TCP; calls,
+  deferred replies, errors, timeouts and reconnection behave the same, and
+  the server limits (connections, outstanding requests, idle timeout) count
+  local connections with the TCP ones. `req->proto` is `ONCRPC_PROTO_LOCAL`.
+- **Who is calling.** `oncRPCSvcLocalCred(req, &uid, &gid)` gives the
+  caller's user and group ids as the kernel reports them: on Linux
+  (`SO_PEERCRED`), macOS and the BSDs (`getpeereid`). Unlike AUTH_SYS
+  credentials, which the client fills in itself, these cannot be forged by
+  the caller. Windows does not report them; the function returns -1.
+  `oncRPCSvcPeer` gives `"local (uid N, gid N)"`.
+- **Who may connect.** Only programs on this machine, and only those the
+  socket file's permissions allow. Create the socket in a directory only
+  the intended users can enter (the file's own mode follows the process's
+  umask).
+- **The socket file.** Closing the server removes it. A server that is
+  killed outright leaves it behind, and `oncRPCServerListen` then fails
+  (the path is taken) until the file is deleted, so stop servers cleanly
+  (see `examples/09_local`). A path that is already in use by a running
+  server also fails, so two servers cannot share one.
+- **rpcbind.** `oncRPCServerPmapRegister` registers a local listener under
+  the network id `local` with its path, and
+  `oncRPCRpcbGetAddr(loop, alloc, NULL, prog, vers, ONCRPC_NETID_LOCAL, cb, data)`
+  returns the path. Clients created with `ONCRPC_PROTO_LOCAL` do not ask
+  rpcbind themselves: they connect to the path they are given.
+
 ### Dispatch without generated code
 
 ```c
@@ -561,7 +605,7 @@ checked once at the end. Use `ONCRPC_XDR_UNBOUNDED` as the maximum for `<>`.
 
 | Function | Description |
 |---|---|
-| `oncRPCClientCreate(loop, alloc, host, port, prog, vers, proto, readyCb, data, &clnt)` | start connecting; `port` 0 asks the host's rpcbind |
+| `oncRPCClientCreate(loop, alloc, host, port, prog, vers, proto, readyCb, data, &clnt)` | start connecting; `port` 0 asks the host's rpcbind; for `ONCRPC_PROTO_LOCAL`, `host` is the socket's path |
 | `oncRPCClientClose(clnt, cb, data)` | cancel outstanding calls, close |
 | `oncRPCClientCall(clnt, proc, xargs, args, xres, res, cb, data)` | start a call |
 | `oncRPCClientSetTimeout(clnt, ms)` | total time per call (default 25000) |
@@ -597,18 +641,25 @@ first. `"127.0.0.1.4.1"` and `"::1.4.1"` are port 4 * 256 + 1 = 1025.
   for `tcp`/`tcp6` and over UDP for `udp`/`udp6`, and over IPv4 or IPv6
   according to how `host` resolves (IPv4 preferred): to find a `tcp6`
   service, give an IPv6 host such as `"::1"`.
-- Registration goes to rpcbind on 127.0.0.1 over UDP. rpcbind records such
-  entries with the owner `unknown` and lets only the same owner, or the
-  superuser over its local socket, remove them; an entry that a program
-  running as root registered through that socket cannot be removed by
-  `oncRPCRpcbUnset`, and rpcbind answers false.
+- Registration (`oncRPCRpcbSet`/`Unset`, `oncRPCPmapSet`/`Unset` and
+  `oncRPCServerPmapRegister`/`Unregister`) goes to rpcbind's local socket
+  when there is one (`/run/rpcbind.sock`, `/var/run/rpcbind.sock` or
+  `/var/run/rpcb.sock`), and otherwise over UDP to 127.0.0.1 (always, on
+  Windows). Through the socket rpcbind knows who is registering: it records
+  the user as the entry's owner (`rpcinfo` shows it) and lets only that
+  user, or root, remove the entry; rpcbind answers false to anyone else.
+  Over UDP the owner is recorded as `unknown`.
+- The network id `local` names Unix-socket services, whose universal
+  address is the socket's path. rpcbind answers questions about them only
+  through its own local socket, so `oncRPCRpcbGetAddr` with
+  `ONCRPC_NETID_LOCAL` always asks there and ignores `host`.
 
 ### Server
 
 | Function | Description |
 |---|---|
 | `oncRPCServerCreate(loop, alloc, &srv)` / `oncRPCServerClose(srv, cb, data)` | |
-| `oncRPCServerListen(srv, proto, ip, port)` | add a TCP or UDP listener (numeric address) |
+| `oncRPCServerListen(srv, proto, ip, port)` | add a TCP or UDP listener (numeric address), or a local one (`ip` is the path) |
 | `oncRPCServerPort(srv, proto)` | port actually bound |
 | `oncRPCServerRegister(srv, prog, vers, dispatch, ctx)` / `oncRPCServerUnregister` | serve a program version |
 | `oncRPCServerPmapRegister(srv, prog, vers, cb, data)` / `oncRPCServerPmapUnregister` | port mapper registration |
@@ -620,6 +671,7 @@ first. `"127.0.0.1.4.1"` and `"::1.4.1"` are port 4 * 256 + 1 = 1025.
 | `oncRPCSvcReply(req, xres, res)` / `oncRPCSvcDrop(req)` | finish a request |
 | `oncRPCSvcErrNoProc / ErrDecode / ErrSystem / ErrNoProg / ErrProgVers / ErrAuth` | error replies |
 | `oncRPCSvcPeer(req, buf, len)` | caller address |
+| `oncRPCSvcLocalCred(req, &uid, &gid)` | caller's user and group over a local socket (not on Windows) |
 
 ### Status codes (`oncRPCStat`)
 
@@ -664,7 +716,9 @@ oncRPCXSpecFree(spec);
 - **Authentication.** AUTH_NONE and AUTH_SYS on both sides. Servers reject
   other flavors with `AUTH_REJECTEDCRED`. Reply verifiers are AUTH_NONE.
 - **Transports.** TCP (RFC 5531 record marking; any number of fragments on
-  receive, one per message on send) and UDP (64 KiB datagrams), IPv4 and IPv6.
+  receive, one per message on send) and UDP (64 KiB datagrams), IPv4 and IPv6;
+  local sockets (Unix domain sockets, Windows named pipes) with the same
+  record marking as TCP.
 - **At-most-once over UDP.** The duplicate-request cache gives at-most-once
   execution for resends that arrive while their entry is cached; a resend
   arriving after the reply has been evicted or expired runs the procedure

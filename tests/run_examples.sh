@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs every example: starts each server on a test port, runs its client,
 # stops it with SIGTERM (background jobs of a script ignore SIGINT).
-# 06_portmap runs only if a port mapper (rpcbind) answers.
+# 06_portmap runs only if a port mapper (rpcbind) answers; 09_local uses a
+# socket in $TMPDIR (default /tmp).
 # Usage: run_examples.sh BUILD_EXAMPLES_DIR (the makefiles' "check" passes it)
 DIR=${1:-build/linux/release/examples}
 BASE=${ONCRPC_TEST_PORT:-39123}
@@ -60,6 +61,25 @@ if command -v rpcinfo > /dev/null 2>&1 && rpcinfo -p 127.0.0.1 > /dev/null 2>&1;
     fi
 else
     echo "-- 06_portmap: skipped (no port mapper running)"
+fi
+
+echo "== 09_local"
+SOCK="${TMPDIR:-/tmp}/oncrpc-ex-$((BASE + 9)).sock"
+rm -f "$SOCK"
+"$DIR/09_local/server" "$SOCK" > "$DIR/09_local/server.log" 2>&1 &
+SERVER=$!
+sleep 0.5
+if "$DIR/09_local/client" "$SOCK"; then
+    echo "-- 09_local: ok"
+else
+    echo "-- 09_local: FAILED (server log follows)"
+    cat "$DIR/09_local/server.log"
+    FAILED=1
+fi
+stop_server
+if [ -e "$SOCK" ]; then
+    echo "-- 09_local: FAILED: socket file left behind"
+    FAILED=1
 fi
 
 echo "== 08_xdr"

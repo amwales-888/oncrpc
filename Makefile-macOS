@@ -51,7 +51,8 @@ ALL_HEADERS := $(HEADERS) internal.h
 # The client/server examples, as directory:name-of-the-.x-file. 08_xdr (XDR
 # only, no networking) is built separately below.
 RPC_EXAMPLES := 01_add:add 02_strings:greet 03_shapes:shapes 04_lists:lists \
-                05_async:delay 06_portmap:clock 07_errors:secure
+                05_async:delay 06_portmap:clock 07_errors:secure \
+                09_local:local
 
 PKGS := libuv
 

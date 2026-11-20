@@ -69,7 +69,9 @@ struct oncRPCClient {
 
     union {
         uv_handle_t h;
+        uv_stream_t s;      /* TCP or local */
         uv_tcp_t    tcp;
+        uv_pipe_t   pipe;
         uv_udp_t    udp;
     } io;
     int                    ioOpen;     /* io handle initialised and not closing */
@@ -383,7 +385,7 @@ static void send_call(oncRPCClient *c, ccall *k)
     cwreq *w;
     uv_buf_t b;
     int r;
-    size_t len = k->msglen - (c->proto == ONCRPC_PROTO_TCP ? 0 : 4);
+    size_t len = k->msglen - (c->proto != ONCRPC_PROTO_UDP ? 0 : 4);
 
     w = (cwreq *)oncRPCAlloc(c->alloc, sizeof(*w));
     if (w != NULL)
@@ -397,8 +399,8 @@ static void send_call(oncRPCClient *c, ccall *k)
     memcpy(w->buf, k->msg + (k->msglen - len), len);
     w->c = c;
     b = uv_buf_init((char *)w->buf, (unsigned int)len);
-    if (c->proto == ONCRPC_PROTO_TCP) {
-        r = uv_write(&w->r.w, (uv_stream_t *)&c->io.tcp, &b, 1, on_tcp_written);
+    if (c->proto != ONCRPC_PROTO_UDP) {
+        r = uv_write(&w->r.w, &c->io.s, &b, 1, on_tcp_written);
     } else {
         r = uv_udp_send(&w->r.u, &c->io.udp, &b, 1, NULL, on_udp_sent);
         /* A failed datagram is simply retried at the next interval. */
@@ -408,15 +410,15 @@ static void send_call(oncRPCClient *c, ccall *k)
     if (r != 0) {
         oncRPCFree(c->alloc, w->buf);
         oncRPCFree(c->alloc, w);
-        if (c->proto == ONCRPC_PROTO_TCP) {
+        if (c->proto != ONCRPC_PROTO_UDP) {
             k->sent = 1;
             reset_connection(c, ONCRPC_ERR_CANTSEND, r);
         }
         return;
     }
     k->sent = 1;
-    if (c->proto == ONCRPC_PROTO_TCP) {
-        /* TCP never retransmits: the encoded message is no longer needed. */
+    if (c->proto != ONCRPC_PROTO_UDP) {
+        /* Streams never retransmit: the encoded message is no longer needed. */
         oncRPCFree(c->alloc, k->msg);
         k->msg = NULL;
     }
@@ -623,7 +625,7 @@ static void on_tcp_connected(uv_connect_t *req, int status)
         connect_failed(c, status);
         return;
     }
-    r = uv_read_start((uv_stream_t *)&c->io.tcp, on_alloc, on_tcp_read);
+    r = uv_read_start(&c->io.s, on_alloc, on_tcp_read);
     if (r != 0) {
         connect_failed(c, r);
         return;
@@ -637,6 +639,20 @@ static void start_connect(oncRPCClient *c)
 
     if (c->state != CS_IDLE || c->ioOpen || c->ioClosing)
         return;
+    if (c->proto == ONCRPC_PROTO_LOCAL) {
+        /* host is the socket's path (or the pipe's name on Windows). */
+        r = uv_pipe_init(c->loop, &c->io.pipe, 0);
+        if (r != 0) {
+            connect_failed(c, r);
+            return;
+        }
+        c->io.h.data = c;
+        c->ioOpen = 1;
+        c->connReq.data = c;
+        c->state = CS_CONNECTING;
+        uv_pipe_connect(&c->connReq, &c->io.pipe, c->host, on_tcp_connected);
+        return;
+    }
     if (c->proto == ONCRPC_PROTO_TCP) {
         r = uv_tcp_init(c->loop, &c->io.tcp);
         if (r != 0) {
@@ -783,7 +799,7 @@ oncRPCStat oncRPCClientCreate(uv_loop_t *loop, const oncRPCAllocator *alloc, con
         *out = NULL;
     if (loop == NULL || alloc == NULL || alloc->realloc == NULL || alloc->free == NULL ||
         host == NULL || out == NULL ||
-        (proto != ONCRPC_PROTO_TCP && proto != ONCRPC_PROTO_UDP))
+        (proto != ONCRPC_PROTO_TCP && proto != ONCRPC_PROTO_UDP && proto != ONCRPC_PROTO_LOCAL))
         return ONCRPC_ERR_INVALID;
     c = (oncRPCClient *)oncRPCAlloc(alloc, sizeof(*c));
     if (c == NULL)
@@ -814,6 +830,12 @@ oncRPCStat oncRPCClientCreate(uv_loop_t *loop, const oncRPCAllocator *alloc, con
     c->timer.data = c;
     *out = c;
 
+    if (proto == ONCRPC_PROTO_LOCAL) {
+        /* A path needs neither name resolution nor a port. */
+        c->state = CS_IDLE;
+        start_connect(c);
+        return ONCRPC_OK;
+    }
     if (port != 0) {
         start_resolve(c);
         return ONCRPC_OK;

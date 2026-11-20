@@ -13,6 +13,7 @@ one or two new ideas, so read them in order.
 | `06_portmap/`  | registering with and finding servers through rpcbind; TCP and UDP; clean shutdown |
 | `07_errors/`   | AUTH_SYS credentials, rejecting callers, timeouts, unknown procedures and versions |
 | `08_xdr/`      | XDR on its own, for files or messages, with no networking      |
+| `09_local/`    | a service on a local socket; knowing which user is calling     |
 
 Building liboncrpc builds them too (see `BUILDING.md`). Where the programs end up:
 
@@ -32,7 +33,8 @@ build/linux/release/examples/01_add/client       # Windows: build\x64\Release\01
 ```
 
 Servers take an optional port number (`server 6000`), and clients an
-optional host and port (`client 127.0.0.1 6000`). `make -f Makefile-<system>
+optional host and port (`client 127.0.0.1 6000`); `09_local` takes a socket
+path instead (`server /tmp/my.sock`, `client /tmp/my.sock`). `make -f Makefile-<system>
 check` (or `tests\run_tests.ps1` on Windows) runs every example;
 `06_portmap` is skipped when no port mapper is running.
 

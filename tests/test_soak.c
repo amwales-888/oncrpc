@@ -1,7 +1,8 @@
 /*
  * test_soak.c - many clients against one server with small limits, UDP
  * traffic passing through a relay that loses, duplicates and reorders
- * datagrams.
+ * datagrams. Half of the stream clients use TCP, the other half a local
+ * socket (a pipe on Windows).
  *
  * Every call carries a unique id; the server counts how often each id runs.
  * The test checks that:
@@ -419,7 +420,7 @@ static void on_add(oncRPCClient *c, oncRPCStat st, void *res, void *data)
     free(k);
     s->outstanding--;
     /* TCP clients sometimes go quiet for longer than the idle timeout. */
-    if (s->proto == ONCRPC_PROTO_TCP && !s->resting && s->toIssue > 0 && chance((unsigned)g_restPct))
+    if (s->proto != ONCRPC_PROTO_UDP && !s->resting && s->toIssue > 0 && chance((unsigned)g_restPct))
         s->resting = 1;
     if (s->resting && s->outstanding == 0) {
         uv_timer_start(&s->rest, on_rest, 60 + rnd() % 60u, 0);
@@ -460,6 +461,7 @@ typedef struct phase {
 } phase;
 
 static oncRPCServer      *g_srv;
+static char               g_localPath[256];   /* the server's local socket */
 static oncRPCServerLimits g_lim;
 static uint64_t           g_samples, g_overEntries, g_overBytes;
 
@@ -513,6 +515,7 @@ static void run_phase(const phase *ph)
     CHECK(oncRPCServerCreate(&g_loop, &A, &g_srv) == ONCRPC_OK);
     CHECK(oncRPCServerListen(g_srv, ONCRPC_PROTO_TCP, "127.0.0.1", 0) == ONCRPC_OK);
     CHECK(oncRPCServerListen(g_srv, ONCRPC_PROTO_UDP, "127.0.0.1", 0) == ONCRPC_OK);
+    CHECK(oncRPCServerListen(g_srv, ONCRPC_PROTO_LOCAL, g_localPath, 0) == ONCRPC_OK);
     CHECK(oncRPCCalcProgV1Register(g_srv, NULL) == ONCRPC_OK);
     CHECK(oncRPCServerSetLimits(g_srv, &ph->lim) == ONCRPC_OK);
     g_lim = ph->lim;
@@ -527,13 +530,15 @@ static void run_phase(const phase *ph)
     g_clientsOpen = 0;
     for (i = 0; i < n; i++) {
         sclient *s = &cl[i];
-        s->proto = i < ph->udpClients ? ONCRPC_PROTO_UDP : ONCRPC_PROTO_TCP;
+        s->proto = i < ph->udpClients ? ONCRPC_PROTO_UDP
+                   : (i - ph->udpClients) % 2 ? ONCRPC_PROTO_LOCAL : ONCRPC_PROTO_TCP;
         s->toIssue = ph->callsPerClient;
         s->window = s->proto == ONCRPC_PROTO_UDP ? 4 : 8;
         uv_timer_init(&g_loop, &s->rest);
         s->rest.data = s;
         s->restOpen = 1;
-        CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1",
+        CHECK(oncRPCClientCreate(&g_loop, &A,
+                                 s->proto == ONCRPC_PROTO_LOCAL ? g_localPath : "127.0.0.1",
                                  s->proto == ONCRPC_PROTO_UDP ? relayPort : port, CALC_PROG,
                                  CALC_VERS, s->proto, NULL, s, &s->c) == ONCRPC_OK);
         if (s->proto == ONCRPC_PROTO_UDP) {
@@ -575,7 +580,7 @@ static void run_phase(const phase *ph)
            (unsigned long long)g_udp.timedOut, (unsigned long long)g_relayed,
            (unsigned long long)g_dropped, (unsigned long long)g_duplicated,
            (unsigned long long)g_reordered);
-    printf("    TCP: %llu calls, %llu ok, %llu lost to idle closes\n",
+    printf("    TCP and local: %llu calls, %llu ok, %llu lost to idle closes\n",
            (unsigned long long)tcpCalls, (unsigned long long)g_tcp.ok,
            (unsigned long long)g_tcp.connLost);
     printf("    server: %llu requests, %llu resends replayed, %llu resends ignored, "
@@ -739,6 +744,19 @@ int main(int argc, char **argv)
     g_rng = (uint32_t)seed ? (uint32_t)seed : 1u;
     printf("  seed %lu, scale %d\n", seed, scale);
     CHECK(uv_loop_init(&g_loop) == 0);
+#ifdef _WIN32
+    snprintf(g_localPath, sizeof(g_localPath), "\\\\.\\pipe\\oncrpc-soak-%d",
+             (int)uv_os_getpid());
+#else
+    {
+        char dir[200];
+        size_t dlen = sizeof(dir);
+        if (uv_os_tmpdir(dir, &dlen) != 0)
+            snprintf(dir, sizeof(dir), "/tmp");
+        snprintf(g_localPath, sizeof(g_localPath), "%s/oncrpc-soak-%d.sock", dir,
+                 (int)uv_os_getpid());
+    }
+#endif
 
     g_dropPct = 15;
     g_dupPct = 5;

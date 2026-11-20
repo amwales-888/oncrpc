@@ -34,7 +34,7 @@
 extern "C" {
 #endif
 
-#define ONCRPC_VERSION_STRING     "3.1.0"
+#define ONCRPC_VERSION_STRING     "3.2.0"
 #define ONCRPC_PROTOCOL_VERSION   2u          /* RPC message protocol version */
 #define ONCRPC_MAX_AUTH_BYTES     400u        /* opaque_auth body limit */
 #define ONCRPC_MAX_MACHINENAME    255u
@@ -75,13 +75,20 @@ extern "C" {
 #define ONCRPC_NETID_UDP          "udp"
 #define ONCRPC_NETID_TCP6         "tcp6"
 #define ONCRPC_NETID_UDP6         "udp6"
-/* Room for any universal address, with its terminating NUL. */
-#define ONCRPC_UADDR_MAX          64u
+#define ONCRPC_NETID_LOCAL        "local"   /* address: the socket's path */
+/* Room for any universal address (or local path), with its terminating NUL. */
+#define ONCRPC_UADDR_MAX          256u
 
-/* Transport protocols (values are the IP protocol numbers). */
+/*
+ * Transports. TCP and UDP have their IP protocol numbers. LOCAL is a Unix
+ * domain socket (a named pipe on Windows), addressed by a path - or a pipe
+ * name such as \\.\pipe\name - instead of a host and port, and framed like
+ * TCP.
+ */
 typedef enum oncRPCProto {
-    ONCRPC_PROTO_TCP = 6,
-    ONCRPC_PROTO_UDP = 17
+    ONCRPC_PROTO_TCP   = 6,
+    ONCRPC_PROTO_UDP   = 17,
+    ONCRPC_PROTO_LOCAL = 256
 } oncRPCProto;
 
 /* Authentication flavors. The library implements NONE and SYS. */
@@ -333,7 +340,10 @@ ONCRPC_API oncRPCStat oncRPCServerCreate(uv_loop_t *loop, const oncRPCAllocator 
  * requests finished after this point are discarded. */
 ONCRPC_API void oncRPCServerClose(oncRPCServer *srv, oncRPCCloseCb cb, void *data);
 /* Listen on numeric address ip (NULL = "0.0.0.0"; "::" for IPv6) and port
- * (0 = any free port). May be called several times. */
+ * (0 = any free port). May be called several times. For ONCRPC_PROTO_LOCAL,
+ * ip is the socket's path (a pipe name on Windows) and port is ignored; the
+ * socket file is removed when the server closes, but one left behind by a
+ * program that did not close makes this fail until it is deleted. */
 ONCRPC_API oncRPCStat oncRPCServerListen(oncRPCServer *srv, oncRPCProto proto,
                                          const char *ip, uint16_t port);
 /* Port of the first listener of the given protocol, 0 if none. */
@@ -431,8 +441,13 @@ ONCRPC_API void *oncRPCSvcDecodeArgs(oncRPCSvcReq *req, oncRPCXdrProc xargs, siz
 ONCRPC_API int  oncRPCSvcReply(oncRPCSvcReq *req, oncRPCXdrProc xres, const void *res);
 /* Finish a request without replying. */
 ONCRPC_API void oncRPCSvcDrop(oncRPCSvcReq *req);
-/* Format the caller's address as "host:port". Returns 0 on success. */
+/* Format the caller's address as "host:port" ("local" for a local
+ * transport, with the uid and gid when known). Returns 0 on success. */
 ONCRPC_API int  oncRPCSvcPeer(const oncRPCSvcReq *req, char *buf, size_t len);
+/* The user and group ids of the process that sent a request over a local
+ * transport, as the operating system reports them (Linux, macOS and the
+ * BSDs; not Windows). Returns 0, or -1 when they are not known. */
+ONCRPC_API int  oncRPCSvcLocalCred(const oncRPCSvcReq *req, uint32_t *uid, uint32_t *gid);
 
 /* Error replies; each finishes the request. */
 ONCRPC_API void oncRPCSvcErrNoProc(oncRPCSvcReq *req);     /* PROC_UNAVAIL */

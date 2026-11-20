@@ -6,7 +6,7 @@
     Runs test_xdr, test_xspec, test_gen, test_rpc and test_rpcb, then each example: the
     example's server is started on a test port, its client is run against it,
     and the server is stopped. 06_portmap is skipped, as Windows has no port
-    mapper (rpcbind). With -Soak, test_soak runs as well: many clients
+    mapper (rpcbind); 09_local uses a named pipe. With -Soak, test_soak runs as well: many clients
     against small server limits, with UDP through a lossy relay (about ten
     seconds at scale 1). The exit status is 0 if everything passed.
 
@@ -116,6 +116,23 @@ foreach ($example in $examples) {
 
 Write-Host "== 06_portmap"
 Write-Host "-- 06_portmap: skipped (needs a port mapper, rpcbind, which Windows does not have)"
+
+Write-Host "== 09_local"
+$pipe = "\\.\pipe\oncrpc-ex-$($BasePort + 9)"
+$log = Join-Path $BinDir "09_local_server.log"
+$server = Start-Process -FilePath (Program '09_local_server') -ArgumentList $pipe `
+                        -NoNewWindow -PassThru -RedirectStandardOutput $log
+Start-Sleep -Milliseconds 500
+& (Program '09_local_client') $pipe
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "-- 09_local: ok"
+} else {
+    Write-Host "-- 09_local: FAILED (server log follows)"
+    Get-Content $log | Write-Host
+    $failed = $true
+}
+Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+$server.WaitForExit()
 
 Write-Host "== 08_xdr"
 & (Program '08_xdr_demo')

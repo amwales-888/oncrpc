@@ -62,8 +62,18 @@ static uv_loop_t g_loop;
 
 /* ---- Server procedures --------------------------------------------------------- */
 
+/* What CALC_NULL saw of its last caller. */
+static oncRPCProto g_nullProto;
+static int         g_nullHasCred;
+static uint32_t    g_nullUid, g_nullGid;
+static char        g_nullPeer[64];
+
 void oncRPCCalcNullV1Svc(oncRPCSvcReq *req)
 {
+    g_nullProto = req->proto;
+    g_nullHasCred = oncRPCSvcLocalCred(req, &g_nullUid, &g_nullGid) == 0;
+    if (oncRPCSvcPeer(req, g_nullPeer, sizeof(g_nullPeer)) != 0)
+        g_nullPeer[0] = '\0';
     (void)oncRPCCalcNullV1Reply(req);
 }
 
@@ -280,7 +290,7 @@ static void f_add(oncRPCClient *c, oncRPCStat st, void *res, void *data)
     f_close_if_done(c, f);
 }
 
-static void functional(oncRPCProto proto, uint16_t port)
+static void functional(oncRPCProto proto, const char *host, uint16_t port)
 {
     static fstate f;
     oncRPCClient *c;
@@ -288,7 +298,7 @@ static void functional(oncRPCProto proto, uint16_t port)
 
     memset(&f, 0, sizeof(f));
     g_closed = 0;
-    CHECK(oncRPCClientCreate(&g_loop, &A, "localhost", port, CALC_PROG, CALC_VERS, proto, NULL,
+    CHECK(oncRPCClientCreate(&g_loop, &A, host, port, CALC_PROG, CALC_VERS, proto, NULL,
                              &f, &c) == ONCRPC_OK);
     oncRPCClientSetAuthSysDefault(c);
     for (i = 0; i < NCONC; i++) {
@@ -532,7 +542,121 @@ static void lifecycle(uint16_t port)
     run();
 }
 
-/* ---- 4. Duplicate-request cache and limits ------------------------------------------ */
+/* ---- 4. Local transport ----------------------------------------------------------- */
+
+static void on_null(oncRPCClient *c, oncRPCStat st, void *res, void *data)
+{
+    estate *e = (estate *)data;
+    (void)res;
+    e->calls++;
+    e->stat = st;
+    oncRPCClientClose(c, on_closed, NULL);
+}
+
+/* A NULL call to path; returns its status. */
+static oncRPCStat local_null(const char *path)
+{
+    oncRPCClient *c;
+    estate e;
+    memset(&e, 0, sizeof(e));
+    g_closed = 0;
+    if (oncRPCClientCreate(&g_loop, &A, path, 0, CALC_PROG, CALC_VERS, ONCRPC_PROTO_LOCAL, NULL,
+                           NULL, &c) != ONCRPC_OK)
+        return ONCRPC_ERR_FAILED;
+    oncRPCClientSetTimeout(c, 5000);
+    CHECK(oncRPCClientCall(c, CALC_NULL, NULL, NULL, NULL, NULL, on_null, &e) == ONCRPC_OK);
+    WAIT(e.calls == 1 && g_closed == 1);
+    return e.stat;
+}
+
+static int path_exists(const char *path)
+{
+    uv_fs_t req;
+    int r = uv_fs_stat(&g_loop, &req, path, NULL);
+    uv_fs_req_cleanup(&req);
+    return r == 0;
+}
+
+static void local_transport(void)
+{
+    oncRPCServer *s, *t;
+    char path[256], missing[256];
+#ifdef _WIN32
+    snprintf(path, sizeof(path), "\\\\.\\pipe\\oncrpc-test-%d", (int)uv_os_getpid());
+    snprintf(missing, sizeof(missing), "\\\\.\\pipe\\oncrpc-test-missing-%d",
+             (int)uv_os_getpid());
+#else
+    char dir[200];
+    size_t dlen = sizeof(dir);
+    if (uv_os_tmpdir(dir, &dlen) != 0)
+        snprintf(dir, sizeof(dir), "/tmp");
+    snprintf(path, sizeof(path), "%s/oncrpc-test-%d.sock", dir, (int)uv_os_getpid());
+    snprintf(missing, sizeof(missing), "%s/oncrpc-test-missing-%d.sock", dir,
+             (int)uv_os_getpid());
+    {
+        /* A socket left by an earlier, interrupted run. */
+        uv_fs_t req;
+        (void)uv_fs_unlink(&g_loop, &req, path, NULL);
+        uv_fs_req_cleanup(&req);
+    }
+#endif
+
+    s = NULL;
+    CHECK(oncRPCServerCreate(&g_loop, &A, &s) == ONCRPC_OK);
+    CHECK(oncRPCServerListen(s, ONCRPC_PROTO_LOCAL, path, 0) == ONCRPC_OK);
+    CHECK(oncRPCCalcProgV1Register(s, NULL) == ONCRPC_OK);
+    CHECK(oncRPCServerPort(s, ONCRPC_PROTO_LOCAL) == 0);
+    CHECK(oncRPCServerListen(s, ONCRPC_PROTO_LOCAL, NULL, 0) == ONCRPC_ERR_INVALID);
+
+    /* Every procedure, many calls at once, deferred replies. */
+    functional(ONCRPC_PROTO_LOCAL, path, 0);
+
+    /* The server knows the transport and, where the system says, the
+     * caller's user and group. */
+    CHECK(local_null(path) == ONCRPC_OK);
+    CHECK(g_nullProto == ONCRPC_PROTO_LOCAL);
+    CHECK(strncmp(g_nullPeer, "local", 5) == 0);
+#ifdef _WIN32
+    CHECK(!g_nullHasCred);
+#else
+    {
+        uv_passwd_t pw;
+        CHECK(g_nullHasCred);
+        if (uv_os_get_passwd(&pw) == 0) {
+            CHECK(g_nullUid == (uint32_t)pw.uid && g_nullGid == (uint32_t)pw.gid);
+            uv_os_free_passwd(&pw);
+        }
+    }
+#endif
+
+    /* A second server cannot take the same path. */
+    t = NULL;
+    CHECK(oncRPCServerCreate(&g_loop, &A, &t) == ONCRPC_OK);
+    CHECK(oncRPCServerListen(t, ONCRPC_PROTO_LOCAL, path, 0) != ONCRPC_OK);
+    oncRPCServerClose(t, NULL, NULL);
+
+    /* Nobody at the path: the call cannot connect. */
+    CHECK(local_null(missing) == ONCRPC_ERR_CANTCONNECT);
+
+    /* Closing removes the socket, so the path can be used again. */
+    g_closed = 0;
+    oncRPCServerClose(s, on_closed, NULL);
+    WAIT(g_closed == 1);
+#ifndef _WIN32
+    CHECK(!path_exists(path));
+#else
+    (void)path_exists;
+#endif
+    s = NULL;
+    CHECK(oncRPCServerCreate(&g_loop, &A, &s) == ONCRPC_OK);
+    CHECK(oncRPCServerListen(s, ONCRPC_PROTO_LOCAL, path, 0) == ONCRPC_OK);
+    CHECK(oncRPCCalcProgV1Register(s, NULL) == ONCRPC_OK);
+    CHECK(local_null(path) == ONCRPC_OK);
+    oncRPCServerClose(s, NULL, NULL);
+    run();
+}
+
+/* ---- 5. Duplicate-request cache and limits ------------------------------------------ */
 
 /* A bare UDP socket, so that requests can be resent byte for byte. */
 static uv_udp_t g_raw;
@@ -915,7 +1039,7 @@ static void limits(void)
     CHECK(g_closed == 1);
 }
 
-/* ---- 5. Out-of-memory sweep -------------------------------------------------------- */
+/* ---- 6. Out-of-memory sweep -------------------------------------------------------- */
 
 typedef struct ostate {
     int           pending;     /* clients still open */
@@ -1068,9 +1192,9 @@ int main(void)
     CHECK(s != NULL);
 
     printf("  functional over TCP\n");
-    functional(ONCRPC_PROTO_TCP, port);
+    functional(ONCRPC_PROTO_TCP, "localhost", port);
     printf("  functional over UDP\n");
-    functional(ONCRPC_PROTO_UDP, port);
+    functional(ONCRPC_PROTO_UDP, "localhost", port);
     printf("  error reporting\n");
     errors(s, port, deadport);
     oncRPCServerClose(s, NULL, NULL);
@@ -1079,6 +1203,10 @@ int main(void)
 
     printf("  lifecycle\n");
     lifecycle(port);
+    CHECK(g_live == 0);
+
+    printf("  local transport\n");
+    local_transport();
     CHECK(g_live == 0);
 
     printf("  duplicate-request cache\n");

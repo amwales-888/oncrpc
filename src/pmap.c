@@ -16,9 +16,31 @@
 #define ONCRPC_PMAP_RETRY_MS   1000u
 #define ONCRPC_NETID_MAX       16u
 
+/*
+ * Where the local daemon is. Its Unix socket comes first: there rpcbind
+ * learns who is asking, so it records the real owner of a registration
+ * (otherwise "unknown") and lets that owner, or root, remove it. The
+ * socket's place differs between systems; UDP on the loopback address is
+ * the last resort (and the only way on Windows).
+ */
+static const char *const local_daemons[] = {
+#ifndef _WIN32
+    "/run/rpcbind.sock",       /* Linux */
+    "/var/run/rpcbind.sock",   /* FreeBSD, older Linux */
+    "/var/run/rpcb.sock",      /* macOS */
+#endif
+    NULL
+};
+#define LOCAL_DAEMONS (sizeof(local_daemons) / sizeof(local_daemons[0]) - 1)
+
 struct rpcbOp {
+    uv_loop_t             *loop;
     const oncRPCAllocator *alloc;
     oncRPCClient          *clnt;
+    char                  *host;        /* NULL: the local daemon */
+    size_t                 attempt;     /* local: which of local_daemons, then UDP */
+    int                    localOnly;   /* GETADDR for netid "local" */
+    uint32_t               highVers;
     uint32_t               proc;        /* SET, UNSET or GETADDR (= GETPORT) */
     uint32_t               rpcbVers;    /* version being tried */
     uint32_t               lowVers;     /* lowest version to fall back to */
@@ -123,6 +145,8 @@ int oncRPCUaddrToSockaddr(const char *uaddr, struct sockaddr_storage *addr)
 
 const char *oncRPCNetid(oncRPCProto proto, int family)
 {
+    if (proto == ONCRPC_PROTO_LOCAL)
+        return ONCRPC_NETID_LOCAL;
     if (proto == ONCRPC_PROTO_TCP)
         return family == AF_INET6 ? ONCRPC_NETID_TCP6 : ONCRPC_NETID_TCP;
     if (proto == ONCRPC_PROTO_UDP)
@@ -181,6 +205,7 @@ static void on_closed(void *data)
     oncRPCCloseCb done = op->doneCb;
     void *doneData = op->doneData;
     oncRPCFree(op->alloc, op->addrRes);
+    oncRPCFree(op->alloc, op->host);
     oncRPCFree(op->alloc, op);
     if (done)
         done(doneData);
@@ -273,6 +298,8 @@ static void on_reply(oncRPCClient *clnt, oncRPCStat st, void *res, void *data)
     }
     if (op->addrRes == NULL || op->addrRes[0] == '\0') {
         finish(op, ONCRPC_ERR_PROGNOTREGISTERED, 0, NULL);
+    } else if (strcmp(op->netid, ONCRPC_NETID_LOCAL) == 0) {
+        finish(op, ONCRPC_OK, 0, op->addrRes);   /* a path: no port */
     } else {
         int port = uaddr_port(op->addrRes);
         if (port <= 0)
@@ -282,6 +309,8 @@ static void on_reply(oncRPCClient *clnt, oncRPCStat st, void *res, void *data)
     }
 }
 
+static oncRPCStat open_attempt(rpcbOp *op);
+
 /* The daemon's address is known: pick the netid and ask. */
 static void on_ready(oncRPCClient *clnt, oncRPCStat st, void *data)
 {
@@ -289,6 +318,15 @@ static void on_ready(oncRPCClient *clnt, oncRPCStat st, void *data)
 
     if (op->cancelled)
         return;
+    if (st != ONCRPC_OK && op->host == NULL && op->attempt + 1 < LOCAL_DAEMONS + !op->localOnly) {
+        /* Not at this socket: try the next place. */
+        oncRPCClientClose(clnt, NULL, NULL);
+        op->attempt++;
+        st = open_attempt(op);
+        if (st != ONCRPC_OK)
+            finish(op, st, 0, NULL);
+        return;
+    }
     if (st != ONCRPC_OK) {
         finish(op, st == ONCRPC_ERR_UNKNOWNHOST ? st : ONCRPC_ERR_PMAPFAILURE, 0, NULL);
         return;
@@ -299,6 +337,38 @@ static void on_ready(oncRPCClient *clnt, oncRPCStat st, void *data)
     ask(op);
 }
 
+/* Connect to the daemon for this attempt. The protocol version starts
+ * again at the highest for each place tried. */
+static oncRPCStat open_attempt(rpcbOp *op)
+{
+    oncRPCProto transport = ONCRPC_PROTO_UDP;
+    const char *where;
+    oncRPCStat st;
+
+    if (op->host == NULL && local_daemons[op->attempt] != NULL) {
+        where = local_daemons[op->attempt];
+        transport = ONCRPC_PROTO_LOCAL;
+    } else {
+        where = op->host != NULL ? op->host : "127.0.0.1";
+        /* rpcbind answers GETADDR for the transport the question arrives
+         * on (the netid in the request does not choose it), so ask about a
+         * TCP service over TCP. SET and UNSET go by the netid. */
+        if (op->proc == ONCRPC_RPCBPROC_GETADDR)
+            transport = op->netid[0] != '\0'
+                            ? (strncmp(op->netid, "tcp", 3) == 0 ? ONCRPC_PROTO_TCP
+                                                                 : ONCRPC_PROTO_UDP)
+                            : op->proto;
+    }
+    op->rpcbVers = op->highVers;
+    st = oncRPCClientCreate(op->loop, op->alloc, where, ONCRPC_PMAP_PORT, ONCRPC_PMAP_PROG,
+                            op->highVers, transport, on_ready, op, &op->clnt);
+    if (st != ONCRPC_OK)
+        return st;
+    oncRPCClientSetTimeout(op->clnt, ONCRPC_PMAP_TIMEOUT_MS);
+    oncRPCClientSetRetry(op->clnt, ONCRPC_PMAP_RETRY_MS);
+    return ONCRPC_OK;
+}
+
 oncRPCStat oncRPCIntRpcbStart(uv_loop_t *loop, const oncRPCAllocator *alloc, const char *host,
                               uint32_t proc, uint32_t highVers, uint32_t lowVers, uint32_t prog,
                               uint32_t vers, const char *netid, oncRPCProto proto,
@@ -306,11 +376,10 @@ oncRPCStat oncRPCIntRpcbStart(uv_loop_t *loop, const oncRPCAllocator *alloc, con
 {
     rpcbOp *op;
     oncRPCStat st;
-    oncRPCProto transport = ONCRPC_PROTO_UDP;
 
     if (out != NULL)
         *out = NULL;
-    if (loop == NULL || alloc == NULL || host == NULL || lowVers < ONCRPC_PMAP_VERS ||
+    if (loop == NULL || alloc == NULL || lowVers < ONCRPC_PMAP_VERS ||
         highVers > ONCRPC_RPCB_VERS4 || lowVers > highVers ||
         (netid != NULL && strlen(netid) >= ONCRPC_NETID_MAX) ||
         (uaddr != NULL && strlen(uaddr) >= ONCRPC_UADDR_MAX) ||
@@ -320,9 +389,10 @@ oncRPCStat oncRPCIntRpcbStart(uv_loop_t *loop, const oncRPCAllocator *alloc, con
     op = (rpcbOp *)oncRPCAlloc(alloc, sizeof(*op));
     if (op == NULL)
         return ONCRPC_ERR_NOMEM;
+    op->loop = loop;
     op->alloc = alloc;
     op->proc = proc;
-    op->rpcbVers = highVers;
+    op->highVers = highVers;
     op->lowVers = lowVers;
     op->prog = prog;
     op->vers = vers;
@@ -333,21 +403,26 @@ oncRPCStat oncRPCIntRpcbStart(uv_loop_t *loop, const oncRPCAllocator *alloc, con
         snprintf(op->uaddr, sizeof(op->uaddr), "%s", uaddr);
     op->cb = cb;
     op->data = data;
-    /* rpcbind answers GETADDR for the transport the question arrives on
-     * (the netid in the request does not choose it), so ask about a TCP
-     * service over TCP. SET and UNSET go by the netid and use UDP. */
-    if (proc == ONCRPC_RPCBPROC_GETADDR)
-        transport = netid != NULL ? (strncmp(netid, "tcp", 3) == 0 ? ONCRPC_PROTO_TCP
-                                                                    : ONCRPC_PROTO_UDP)
-                                  : proto;
-    st = oncRPCClientCreate(loop, alloc, host, ONCRPC_PMAP_PORT, ONCRPC_PMAP_PROG, highVers,
-                            transport, on_ready, op, &op->clnt);
+    /* A local service can only be looked up through the local socket. */
+    op->localOnly = proc == ONCRPC_RPCBPROC_GETADDR && netid != NULL &&
+                    strcmp(netid, ONCRPC_NETID_LOCAL) == 0;
+    if (op->localOnly) {
+        host = NULL;
+        if (LOCAL_DAEMONS == 0) {
+            oncRPCFree(alloc, op);
+            return ONCRPC_ERR_INVALID;
+        }
+    }
+    if (host != NULL && (op->host = oncRPCStrdup(alloc, host)) == NULL) {
+        oncRPCFree(alloc, op);
+        return ONCRPC_ERR_NOMEM;
+    }
+    st = open_attempt(op);
     if (st != ONCRPC_OK) {
+        oncRPCFree(alloc, op->host);
         oncRPCFree(alloc, op);
         return st;
     }
-    oncRPCClientSetTimeout(op->clnt, ONCRPC_PMAP_TIMEOUT_MS);
-    oncRPCClientSetRetry(op->clnt, ONCRPC_PMAP_RETRY_MS);
     if (out != NULL)
         *out = op;
     return ONCRPC_OK;
@@ -431,14 +506,14 @@ oncRPCStat oncRPCPmapSet(uv_loop_t *loop, const oncRPCAllocator *alloc, uint32_t
         return ONCRPC_ERR_INVALID;
     snprintf(uaddr, sizeof(uaddr), "0.0.0.0.%u.%u", (unsigned)(port >> 8),
              (unsigned)(port & 0xffu));
-    return start_public(loop, alloc, "127.0.0.1", ONCRPC_PMAPPROC_SET, ONCRPC_PMAP_VERS,
+    return start_public(loop, alloc, NULL, ONCRPC_PMAPPROC_SET, ONCRPC_PMAP_VERS,
                         ONCRPC_PMAP_VERS, prog, vers, netid, proto, uaddr, cb, NULL, data);
 }
 
 oncRPCStat oncRPCPmapUnset(uv_loop_t *loop, const oncRPCAllocator *alloc, uint32_t prog,
                            uint32_t vers, oncRPCPmapCb cb, void *data)
 {
-    return start_public(loop, alloc, "127.0.0.1", ONCRPC_PMAPPROC_UNSET, ONCRPC_PMAP_VERS,
+    return start_public(loop, alloc, NULL, ONCRPC_PMAPPROC_UNSET, ONCRPC_PMAP_VERS,
                         ONCRPC_PMAP_VERS, prog, vers, "", ONCRPC_PROTO_TCP, "", cb, NULL, data);
 }
 
@@ -459,7 +534,7 @@ oncRPCStat oncRPCRpcbSet(uv_loop_t *loop, const oncRPCAllocator *alloc, uint32_t
 {
     if (netid == NULL || uaddr == NULL)
         return ONCRPC_ERR_INVALID;
-    return start_public(loop, alloc, "127.0.0.1", ONCRPC_RPCBPROC_SET, ONCRPC_RPCB_VERS4,
+    return start_public(loop, alloc, NULL, ONCRPC_RPCBPROC_SET, ONCRPC_RPCB_VERS4,
                         ONCRPC_RPCB_VERS, prog, vers, netid, ONCRPC_PROTO_TCP, uaddr, cb, NULL,
                         data);
 }
@@ -467,7 +542,7 @@ oncRPCStat oncRPCRpcbSet(uv_loop_t *loop, const oncRPCAllocator *alloc, uint32_t
 oncRPCStat oncRPCRpcbUnset(uv_loop_t *loop, const oncRPCAllocator *alloc, uint32_t prog,
                            uint32_t vers, const char *netid, oncRPCPmapCb cb, void *data)
 {
-    return start_public(loop, alloc, "127.0.0.1", ONCRPC_RPCBPROC_UNSET, ONCRPC_RPCB_VERS4,
+    return start_public(loop, alloc, NULL, ONCRPC_RPCBPROC_UNSET, ONCRPC_RPCB_VERS4,
                         ONCRPC_RPCB_VERS, prog, vers, netid != NULL ? netid : "",
                         ONCRPC_PROTO_TCP, "", cb, NULL, data);
 }

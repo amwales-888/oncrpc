@@ -5,7 +5,9 @@
  *     malformed input (always runs)
  *  2. with an rpcbind daemon on 127.0.0.1:111: set, look up and unset
  *     entries by network id; a server registers its listeners and clients
- *     with port 0 find it over TCP and UDP; unregistering removes it
+ *     with port 0 find it over TCP and UDP; a local (Unix socket) listener
+ *     is registered as netid "local" and found by its path; unregistering
+ *     removes it all
  *  3. with nothing on port 111 and permission to listen there: a stand-in
  *     port mapper that speaks only version 2, to check that registration
  *     and look-ups fall back to it, and that the version 3/4 functions
@@ -245,6 +247,55 @@ static answer pmap_getport(oncRPCProto proto)
     return a;
 }
 
+/* A path for a local listener (a pipe name on Windows). */
+static void local_path(char *buf, size_t len)
+{
+#ifdef _WIN32
+    snprintf(buf, len, "\\\\.\\pipe\\oncrpc-rpcb-%d", (int)uv_os_getpid());
+#else
+    char dir[200];
+    size_t dlen = sizeof(dir);
+    uv_fs_t req;
+    if (uv_os_tmpdir(dir, &dlen) != 0)
+        snprintf(dir, sizeof(dir), "/tmp");
+    snprintf(buf, len, "%s/oncrpc-rpcb-%d.sock", dir, (int)uv_os_getpid());
+    (void)uv_fs_unlink(&g_loop, &req, buf, NULL);
+    uv_fs_req_cleanup(&req);
+#endif
+}
+
+static oncRPCServer *start_service_local(const char *path)
+{
+    oncRPCServer *s = start_service();
+    if (s != NULL && oncRPCServerListen(s, ONCRPC_PROTO_LOCAL, path, 0) != ONCRPC_OK) {
+        oncRPCServerClose(s, NULL, NULL);
+        return NULL;
+    }
+    return s;
+}
+
+#ifndef _WIN32   /* Windows has no rpcbind to find local services through */
+static oncRPCStat call_local(const char *path)
+{
+    oncRPCClient *c;
+    answer a;
+    uint32_t v = 0;
+
+    memset(&a, 0, sizeof(a));
+    if (oncRPCClientCreate(&g_loop, &A, path, 0, TEST_PROG, TEST_VERS, ONCRPC_PROTO_LOCAL, NULL,
+                           NULL, &c) != ONCRPC_OK)
+        return ONCRPC_ERR_FAILED;
+    if (oncRPCClientCall(c, 1, NULL, NULL, xdr_u32, &v, on_call, &a) != ONCRPC_OK) {
+        oncRPCClientClose(c, NULL, NULL);
+        return ONCRPC_ERR_FAILED;
+    }
+    WAIT(a.done);
+    if (a.st == ONCRPC_OK)
+        CHECK(v == 42);
+    return a.st;
+}
+#endif
+
 /* Remove anything an earlier, interrupted run left behind. */
 static void unset_all(void)
 {
@@ -261,7 +312,7 @@ static void test_rpcbind(void)
     oncRPCServer *s;
     answer a;
     uint16_t tport, uport;
-    char want[ONCRPC_UADDR_MAX];
+    char want[ONCRPC_UADDR_MAX], path[ONCRPC_UADDR_MAX];
 
     printf("  rpcbind on 127.0.0.1:111\n");
     unset_all();
@@ -309,7 +360,8 @@ static void test_rpcbind(void)
     CHECK(a.st == ONCRPC_ERR_PROGNOTREGISTERED);
 
     /* A server registers its listeners; clients with port 0 find them. */
-    s = start_service();
+    local_path(path, sizeof(path));
+    s = start_service_local(path);
     CHECK(s != NULL);
     if (s == NULL)
         return;
@@ -327,6 +379,14 @@ static void test_rpcbind(void)
     CHECK(a.st == ONCRPC_OK && strcmp(a.uaddr, want) == 0);
     CHECK(call_via_lookup(ONCRPC_PROTO_TCP) == ONCRPC_OK);
     CHECK(call_via_lookup(ONCRPC_PROTO_UDP) == ONCRPC_OK);
+#ifndef _WIN32
+    /* The local listener is registered by its path, and the path that
+     * rpcbind gives back leads to the server. */
+    a = getaddr(ONCRPC_NETID_LOCAL);
+    CHECK(a.st == ONCRPC_OK && strcmp(a.uaddr, path) == 0);
+    if (a.st == ONCRPC_OK)
+        CHECK(call_local(a.uaddr) == ONCRPC_OK);
+#endif
 
     /* Registering again replaces the entries rather than failing. */
     memset(&a, 0, sizeof(a));
@@ -340,6 +400,10 @@ static void test_rpcbind(void)
     CHECK(a.st == ONCRPC_OK);
     a = getaddr(ONCRPC_NETID_TCP);
     CHECK(a.st == ONCRPC_ERR_PROGNOTREGISTERED);
+#ifndef _WIN32
+    a = getaddr(ONCRPC_NETID_LOCAL);
+    CHECK(a.st == ONCRPC_ERR_PROGNOTREGISTERED);
+#endif
     CHECK(call_via_lookup(ONCRPC_PROTO_TCP) == ONCRPC_ERR_PROGNOTREGISTERED);
     close_service(s);
 }
@@ -422,6 +486,7 @@ static void test_portmap_v2(void)
 {
     oncRPCServer *pm, *s;
     answer a;
+    char path[ONCRPC_UADDR_MAX];
 
     if (oncRPCServerCreate(&g_loop, &A, &pm) != ONCRPC_OK)
         return;
@@ -435,17 +500,20 @@ static void test_portmap_v2(void)
     CHECK(oncRPCServerRegister(pm, ONCRPC_PMAP_PROG, ONCRPC_PMAP_VERS, pmap2_dispatch, NULL) ==
           ONCRPC_OK);
 
-    s = start_service();
+    local_path(path, sizeof(path));
+    s = start_service_local(path);
     CHECK(s != NULL);
     if (s == NULL) {
         close_service(pm);
         return;
     }
-    /* Registration: versions 4 and 3 are refused, so version 2 is used. */
+    /* Registration: versions 4 and 3 are refused, so version 2 is used. It
+     * cannot describe the local listener, which is reported, but the TCP
+     * and UDP listeners are registered. */
     memset(&a, 0, sizeof(a));
     CHECK(oncRPCServerPmapRegister(s, TEST_PROG, TEST_VERS, on_srv_pmap, &a) == ONCRPC_OK);
     WAIT(a.done);
-    CHECK(a.st == ONCRPC_OK);
+    CHECK(a.st == ONCRPC_ERR_PMAPFAILURE);
     CHECK(mapped_port(ONCRPC_PROTO_TCP) == oncRPCServerPort(s, ONCRPC_PROTO_TCP));
     CHECK(mapped_port(ONCRPC_PROTO_UDP) == oncRPCServerPort(s, ONCRPC_PROTO_UDP));
 

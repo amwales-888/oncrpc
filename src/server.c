@@ -1,21 +1,29 @@
 /*
- * server.c - asynchronous RPC server on libuv serving any number of TCP and
- * UDP listeners. Requests may be answered inside the dispatch routine or
- * at any later time.
+ * server.c - asynchronous RPC server on libuv serving any number of TCP, UDP
+ * and local (Unix socket / Windows pipe) listeners. Requests may be answered
+ * inside the dispatch routine or at any later time.
  */
 #include "internal.h"
 
 #include <stdio.h>
 #include <string.h>
+#if defined(__linux__)
+#include <asm/socket.h>   /* SO_PEERCRED, which glibc shows only to _GNU_SOURCE */
+#elif !defined(_WIN32)
+#include <unistd.h>       /* getpeereid */
+#endif
 
 typedef struct slistener {
     union {
         uv_handle_t h;
+        uv_stream_t s;
         uv_tcp_t    tcp;
         uv_udp_t    udp;
+        uv_pipe_t   pipe;
     } io;
     oncRPCServer     *srv;
     oncRPCProto       proto;
+    char             *path;         /* local listeners */
     uint16_t          port;
     struct sockaddr_storage bound;  /* address actually bound */
     uint8_t          *ubuf;         /* UDP datagram buffer */
@@ -23,8 +31,17 @@ typedef struct slistener {
 } slistener;
 
 typedef struct sconn {
-    uv_tcp_t                tcp;
+    union {
+        uv_handle_t h;
+        uv_stream_t s;
+        uv_tcp_t    tcp;
+        uv_pipe_t   pipe;
+    } io;
     oncRPCServer           *srv;
+    oncRPCProto             proto;        /* TCP or LOCAL */
+    int                     hasCred;      /* local: peer credentials known */
+    uint32_t                uid;
+    uint32_t                gid;
     uint8_t                *buf;
     size_t                  len;
     size_t                  cap;
@@ -85,6 +102,9 @@ typedef struct svcCall {
     int                     finished;
     oncRPCAuthSysParams     sys;
     drcEntry               *drc;       /* UDP duplicate cache entry, if any */
+    int                     hasCred;   /* local: the caller's uid and gid */
+    uint32_t                uid;
+    uint32_t                gid;
     struct svcCall         *next;      /* in conn->reqs */
     struct svcCall         *prev;
 } svcCall;
@@ -392,7 +412,7 @@ static void conn_pause(sconn *c)
     c->paused = 1;
     s->pausedConns++;
     s->stats.connectionsPaused++;
-    (void)uv_read_stop((uv_stream_t *)&c->tcp);
+    (void)uv_read_stop(&c->io.s);
 }
 
 /* Paused connections are restarted from an idle callback rather than from
@@ -490,7 +510,7 @@ static void transmit(svcCall *r, uint8_t *buf, size_t len)
     uv_buf_t b;
     int rc;
 
-    if (s->closing || (r->pub.proto == ONCRPC_PROTO_TCP && (r->conn == NULL || r->conn->closing)) ||
+    if (s->closing || (r->pub.proto != ONCRPC_PROTO_UDP && (r->conn == NULL || r->conn->closing)) ||
         (r->pub.proto == ONCRPC_PROTO_UDP && r->lis == NULL) ||
         (w = (swreq *)oncRPCAlloc(s->alloc, sizeof(*w))) == NULL) {
         oncRPCFree(s->alloc, buf);
@@ -500,10 +520,10 @@ static void transmit(svcCall *r, uint8_t *buf, size_t len)
     w->buf = buf;
     if (r->drc != NULL)
         drc_answered(s, r->drc, buf + 4, len - 4);
-    if (r->pub.proto == ONCRPC_PROTO_TCP) {
+    if (r->pub.proto != ONCRPC_PROTO_UDP) {
         oncRPCIntPutBe32(buf, (uint32_t)(len - 4) | ONCRPC_LAST_FRAGMENT);
         b = uv_buf_init((char *)buf, (unsigned int)len);
-        rc = uv_write(&w->r.w, (uv_stream_t *)&r->conn->tcp, &b, 1, on_written);
+        rc = uv_write(&w->r.w, &r->conn->io.s, &b, 1, on_written);
     } else {
         b = uv_buf_init((char *)buf + 4, (unsigned int)(len - 4));
         rc = uv_udp_send(&w->r.u, &r->lis->io.udp, &b, 1,
@@ -717,7 +737,27 @@ int oncRPCSvcPeer(const oncRPCSvcReq *req, char *buf, size_t len)
         snprintf(buf, len, "[%s]:%u", host, port_of(&a->sin6_port));
         return 0;
     }
+    if (r->pub.proto == ONCRPC_PROTO_LOCAL) {
+        if (r->hasCred)
+            snprintf(buf, len, "local (uid %lu, gid %lu)", (unsigned long)r->uid,
+                     (unsigned long)r->gid);
+        else
+            snprintf(buf, len, "local");
+        return 0;
+    }
     return -1;
+}
+
+int oncRPCSvcLocalCred(const oncRPCSvcReq *req, uint32_t *uid, uint32_t *gid)
+{
+    const svcCall *r = (const svcCall *)(const void *)req;
+    if (r == NULL || !r->hasCred)
+        return -1;
+    if (uid != NULL)
+        *uid = r->uid;
+    if (gid != NULL)
+        *gid = r->gid;
+    return 0;
 }
 
 /* ---- Incoming calls -------------------------------------------------------------- */
@@ -754,6 +794,9 @@ static int handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCPr
     r->lis = lis;
     memcpy(&r->peer, peer, sizeof(r->peer));
     if (conn != NULL) {
+        r->hasCred = conn->hasCred;
+        r->uid = conn->uid;
+        r->gid = conn->gid;
         r->conn = conn;
         r->next = conn->reqs;
         if (conn->reqs)
@@ -859,7 +902,7 @@ static void conn_close(sconn *c)
     if (c->next)
         c->next->prev = c->prev;
     s->activeCloses++;
-    uv_close((uv_handle_t *)&c->tcp, on_conn_closed);
+    uv_close(&c->io.h, on_conn_closed);
 }
 
 static void on_conn_alloc(uv_handle_t *h, size_t suggested, uv_buf_t *b)
@@ -897,7 +940,7 @@ static void conn_process(sconn *c)
             conn_close(c);
             return;
         }
-        (void)handle_call(s, s->msg, mlen, ONCRPC_PROTO_TCP, c, NULL, &c->peer, NULL);
+        (void)handle_call(s, s->msg, mlen, c->proto, c, NULL, &c->peer, NULL);
     }
 }
 
@@ -931,9 +974,53 @@ static void on_resume(uv_idle_t *h)
         s->pausedConns--;
         conn_process(c);
         if (!c->closing && !c->paused &&
-            uv_read_start((uv_stream_t *)&c->tcp, on_conn_alloc, on_conn_read) != 0)
+            uv_read_start(&c->io.s, on_conn_alloc, on_conn_read) != 0)
             conn_close(c);
     }
+}
+
+/* The user and group of the process at the other end of a local
+ * connection, where the system can tell. */
+static int local_peer_cred(uv_stream_t *st, uint32_t *uid, uint32_t *gid)
+{
+#if defined(_WIN32)
+    (void)st;
+    (void)uid;
+    (void)gid;
+    return -1;
+#else
+    uv_os_fd_t fd;
+    if (uv_fileno((const uv_handle_t *)st, &fd) != 0)
+        return -1;
+#if defined(__linux__) && defined(SO_PEERCRED)
+    {
+        /* The layout of struct ucred, which glibc shows only to _GNU_SOURCE. */
+        struct { int32_t pid; uint32_t uid; uint32_t gid; } cr;
+        socklen_t n = (socklen_t)sizeof(cr);
+        if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &n) != 0 || n != sizeof(cr))
+            return -1;
+        *uid = cr.uid;
+        *gid = cr.gid;
+        return 0;
+    }
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+      defined(__NetBSD__) || defined(__DragonFly__)
+    {
+        uid_t u;
+        gid_t g;
+        if (getpeereid(fd, &u, &g) != 0)
+            return -1;
+        *uid = (uint32_t)u;
+        *gid = (uint32_t)g;
+        return 0;
+    }
+#else
+    (void)fd;
+    (void)uid;
+    (void)gid;
+    return -1;
+#endif
+#endif
 }
 
 static void on_connection(uv_stream_t *server, int status)
@@ -946,20 +1033,22 @@ static void on_connection(uv_stream_t *server, int status)
     if (status < 0 || s->closing)
         return;
     c = (sconn *)oncRPCAlloc(s->alloc, sizeof(*c));
-    if (c == NULL || uv_tcp_init(s->loop, &c->tcp) != 0) {
+    if (c == NULL || (l->proto == ONCRPC_PROTO_LOCAL ? uv_pipe_init(s->loop, &c->io.pipe, 0)
+                                                     : uv_tcp_init(s->loop, &c->io.tcp)) != 0) {
         /* Cannot accept without a handle; the peer will see a reset/timeout. */
         oncRPCFree(s->alloc, c);
         return;
     }
     c->srv = s;
-    c->tcp.data = c;
+    c->proto = l->proto;
+    c->io.h.data = c;
     c->idleTicks = 0;
     c->next = s->conns;
     if (s->conns)
         s->conns->prev = c;
     s->conns = c;
     s->nconns++;
-    if (uv_accept(server, (uv_stream_t *)&c->tcp) != 0) {
+    if (uv_accept(server, &c->io.s) != 0) {
         conn_close(c);
         return;
     }
@@ -969,9 +1058,13 @@ static void on_connection(uv_stream_t *server, int status)
         return;
     }
     s->stats.connectionsAccepted++;
-    (void)uv_tcp_nodelay(&c->tcp, 1);
-    (void)uv_tcp_getpeername(&c->tcp, (struct sockaddr *)&c->peer, &len);
-    if (uv_read_start((uv_stream_t *)&c->tcp, on_conn_alloc, on_conn_read) != 0)
+    if (c->proto == ONCRPC_PROTO_TCP) {
+        (void)uv_tcp_nodelay(&c->io.tcp, 1);
+        (void)uv_tcp_getpeername(&c->io.tcp, (struct sockaddr *)&c->peer, &len);
+    } else {
+        c->hasCred = local_peer_cred(&c->io.s, &c->uid, &c->gid) == 0;
+    }
+    if (uv_read_start(&c->io.s, on_conn_alloc, on_conn_read) != 0)
         conn_close(c);
 }
 
@@ -1123,9 +1216,62 @@ static void on_listener_closed(uv_handle_t *h)
     slistener *l = (slistener *)h->data;
     oncRPCServer *s = l->srv;
     oncRPCFree(s->alloc, l->ubuf);
+    oncRPCFree(s->alloc, l->path);
     oncRPCFree(s->alloc, l);
     s->activeCloses--;
     maybe_finish_close(s);
+}
+
+/* Append, so oncRPCServerPort reports the first listener. */
+static void add_listener(oncRPCServer *s, slistener *l)
+{
+    if (s->listeners == NULL) {
+        s->listeners = l;
+    } else {
+        slistener *t = s->listeners;
+        while (t->next)
+            t = t->next;
+        t->next = l;
+    }
+}
+
+/* A Unix domain socket at path (a named pipe on Windows). libuv removes the
+ * socket file when the listener closes; a file left by a program that did
+ * not close makes the bind fail. */
+static oncRPCStat listen_local(oncRPCServer *s, const char *path)
+{
+    slistener *l;
+    int r;
+
+    if (path == NULL || path[0] == '\0')
+        return ONCRPC_ERR_INVALID;
+    l = (slistener *)oncRPCAlloc(s->alloc, sizeof(*l));
+    if (l == NULL)
+        return ONCRPC_ERR_NOMEM;
+    l->srv = s;
+    l->proto = ONCRPC_PROTO_LOCAL;
+    l->path = oncRPCStrdup(s->alloc, path);
+    if (l->path == NULL) {
+        oncRPCFree(s->alloc, l);
+        return ONCRPC_ERR_NOMEM;
+    }
+    r = uv_pipe_init(s->loop, &l->io.pipe, 0);
+    if (r != 0) {
+        oncRPCFree(s->alloc, l->path);
+        oncRPCFree(s->alloc, l);
+        return oncRPCIntUvStat(r, ONCRPC_ERR_FAILED);
+    }
+    l->io.h.data = l;
+    r = uv_pipe_bind(&l->io.pipe, path);
+    if (r == 0)
+        r = uv_listen(&l->io.s, 128, on_connection);
+    if (r != 0) {
+        s->activeCloses++;
+        uv_close(&l->io.h, on_listener_closed);
+        return oncRPCIntUvStat(r, ONCRPC_ERR_FAILED);
+    }
+    add_listener(s, l);
+    return ONCRPC_OK;
 }
 
 void oncRPCServerClose(oncRPCServer *s, oncRPCCloseCb cb, void *data)
@@ -1157,8 +1303,11 @@ oncRPCStat oncRPCServerListen(oncRPCServer *s, oncRPCProto proto, const char *ip
     slistener *l;
     int r, namelen = (int)sizeof(addr);
 
-    if (s == NULL || s->closing || (proto != ONCRPC_PROTO_TCP && proto != ONCRPC_PROTO_UDP))
+    if (s == NULL || s->closing ||
+        (proto != ONCRPC_PROTO_TCP && proto != ONCRPC_PROTO_UDP && proto != ONCRPC_PROTO_LOCAL))
         return ONCRPC_ERR_INVALID;
+    if (proto == ONCRPC_PROTO_LOCAL)
+        return listen_local(s, ip);
     if (ip == NULL)
         ip = "0.0.0.0";
     memset(&addr, 0, sizeof(addr));
@@ -1208,15 +1357,7 @@ oncRPCStat oncRPCServerListen(oncRPCServer *s, oncRPCProto proto, const char *ip
     l->port = (uint16_t)(addr.ss_family == AF_INET6
                              ? port_of(&((struct sockaddr_in6 *)&addr)->sin6_port)
                              : port_of(&((struct sockaddr_in *)&addr)->sin_port));
-    /* Append, so oncRPCServerPort reports the first listener. */
-    if (s->listeners == NULL) {
-        s->listeners = l;
-    } else {
-        slistener *t = s->listeners;
-        while (t->next)
-            t = t->next;
-        t->next = l;
-    }
+    add_listener(s, l);
     return ONCRPC_OK;
 }
 
@@ -1381,18 +1522,26 @@ static void on_pmap_unset(oncRPCStat st, uint32_t rpcbVers, uint32_t ok, const c
         const char *netid = oncRPCNetid(l->proto, l->bound.ss_family);
         oncRPCStat r;
 
-        if (rpcbVers == ONCRPC_PMAP_VERS && l->bound.ss_family == AF_INET6) {
-            /* The port mapper cannot describe IPv6 services. */
+        if (rpcbVers == ONCRPC_PMAP_VERS &&
+            (l->proto == ONCRPC_PROTO_LOCAL || l->bound.ss_family == AF_INET6)) {
+            /* The port mapper cannot describe IPv6 or local services. */
             job_failed(j, ONCRPC_ERR_PMAPFAILURE);
             continue;
         }
-        if (netid == NULL ||
-            oncRPCUaddrFromSockaddr((const struct sockaddr *)&l->bound, uaddr_,
-                                    sizeof(uaddr_)) != 0) {
+        if (l->proto == ONCRPC_PROTO_LOCAL) {
+            /* A local service's universal address is its path. */
+            if (strlen(l->path) >= sizeof(uaddr_)) {
+                job_failed(j, ONCRPC_ERR_INVALID);
+                continue;
+            }
+            memcpy(uaddr_, l->path, strlen(l->path) + 1);
+        } else if (netid == NULL ||
+                   oncRPCUaddrFromSockaddr((const struct sockaddr *)&l->bound, uaddr_,
+                                           sizeof(uaddr_)) != 0) {
             job_failed(j, ONCRPC_ERR_FAILED);
             continue;
         }
-        r = oncRPCIntRpcbStart(s->loop, s->alloc, "127.0.0.1", ONCRPC_RPCBPROC_SET, rpcbVers,
+        r = oncRPCIntRpcbStart(s->loop, s->alloc, NULL, ONCRPC_RPCBPROC_SET, rpcbVers,
                                rpcbVers, j->prog, j->vers, netid, l->proto, uaddr_,
                                on_pmap_set, j, NULL);
         if (r == ONCRPC_OK)
@@ -1427,7 +1576,7 @@ static oncRPCStat start_job(oncRPCServer *s, uint32_t prog, uint32_t vers, int r
     j->data = data;
     /* Remove the program version for every network id; this also finds the
      * newest protocol version the daemon speaks. */
-    st = oncRPCIntRpcbStart(s->loop, s->alloc, "127.0.0.1", ONCRPC_RPCBPROC_UNSET,
+    st = oncRPCIntRpcbStart(s->loop, s->alloc, NULL, ONCRPC_RPCBPROC_UNSET,
                             ONCRPC_RPCB_VERS4, ONCRPC_PMAP_VERS, prog, vers, "",
                             ONCRPC_PROTO_TCP, "", on_pmap_unset, j, NULL);
     if (st != ONCRPC_OK) {

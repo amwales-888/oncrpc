@@ -185,7 +185,7 @@ The solution has these projects:
 |---|---|---|
 | `liboncrpc` | `liboncrpc.lib` | `src\*.c` |
 | `oncrpcgen` | `oncrpcgen.exe` | `src\oncrpcgen.c` + liboncrpc |
-| `examples\01_add_server`, `01_add_client`, ... `07_errors_client` | `<project>.exe` | `examples\<example>\server.c` or `client.c` + generated code |
+| `examples\01_add_server`, `01_add_client`, ... `07_errors_client`, `09_local_server`, `09_local_client` | `<project>.exe` | `examples\<example>\server.c` or `client.c` + generated code |
 | `examples\08_xdr_demo` | `08_xdr_demo.exe` | `examples\08_xdr\main.c` + generated code |
 | `tests\test_xdr`, `test_xspec`, `test_gen`, `test_rpc`, `test_rpcb`, `test_soak` | `<project>.exe` | `tests\*.c` |
 
@@ -269,17 +269,17 @@ same code as on Linux, apart from line endings.
 | `test_xdr`   | XDR primitives against hand-worked byte layouts, bounds, failures |
 | `test_xspec` | the `.x` parser: every construct, error messages and line numbers |
 | `test_gen`   | generated XDR code for every declaration form: encode, decode, re-encode, truncated input; with make, the generated client, server and both skeletons are also built with `-Werror` |
-| `test_rpc`   | a client and a server in one loop: 200 concurrent calls, deferred replies, TCP and UDP, timeouts, retransmission, cancellation, refused connections, unknown hosts, reconnection, a server closing while requests are open, the UDP duplicate-request cache (replays, ignored resends, expiry, eviction, size limits), the server limits (connections, outstanding requests, pausing and resuming connections, idle timeout), and two out-of-memory sweeps that fail each allocation in turn and check that nothing leaks |
+| `test_rpc`   | a client and a server in one loop: 200 concurrent calls, deferred replies, TCP and UDP, timeouts, retransmission, cancellation, refused connections, unknown hosts, reconnection, a server closing while requests are open, the same calls over a local socket (with the caller's uid and gid, a path already in use, the socket file removed on close), the UDP duplicate-request cache (replays, ignored resends, expiry, eviction, size limits), the server limits (connections, outstanding requests, pausing and resuming connections, idle timeout), and two out-of-memory sweeps that fail each allocation in turn and check that nothing leaks |
 | `check-alloc`| (make only) `nm` check that the library never references the C allocator |
-| `test_rpcb`  | universal addresses (IPv4, IPv6, malformed input); with rpcbind running, entries set, looked up and removed by network id, a server's listeners registered and found by clients over TCP and UDP; with nothing on port 111 and permission to listen there, a stand-in version 2 port mapper that registration and look-ups must fall back to. The parts that cannot run are skipped |
-| examples     | every example's client against its server; `06_portmap` only if a port mapper answers (`tests/run_examples.sh`) |
+| `test_rpcb`  | universal addresses (IPv4, IPv6, malformed input); with rpcbind running, entries set, looked up and removed by network id, a server's listeners registered and found by clients over TCP and UDP, and its local socket registered as `local` and found by its path; with nothing on port 111 and permission to listen there, a stand-in version 2 port mapper that registration and look-ups must fall back to. The parts that cannot run are skipped |
+| examples     | every example's client against its server; `06_portmap` only if a port mapper answers; `09_local` over a socket in `$TMPDIR` (a named pipe on Windows) (`tests/run_examples.sh`) |
 
 The soak test runs separately, with `make soak` or
 `tests\run_tests.ps1 -Soak`, as it takes about ten seconds:
 
 | Test         | What it covers |
 |--------------|----------------|
-| `test_soak`  | 60 clients against one server with small limits (4 requests per connection, 32 in all, 40 ms idle timeout). UDP passes through a relay that loses 15% of datagrams, duplicates 5% and delays 20%; some calls are answered late. Every call carries an id and the server counts how often each runs. With a cache large enough to hold every request, no UDP call may run twice; with a tiny one, calls may run again but every answer must be right and the cache must stay within its limits. Also checks that every call either succeeds or fails only in the ways the conditions allow, that the server's counters agree with what the procedures saw, that the connection limit refuses the surplus clients, and that nothing leaks. |
+| `test_soak`  | 60 clients (40 over UDP, 10 over TCP, 10 over a local socket) against one server with small limits (4 requests per connection, 32 in all, 40 ms idle timeout). UDP passes through a relay that loses 15% of datagrams, duplicates 5% and delays 20%; some calls are answered late. Every call carries an id and the server counts how often each runs. With a cache large enough to hold every request, no UDP call may run twice; with a tiny one, calls may run again but every answer must be right and the cache must stay within its limits. Also checks that every call either succeeds or fails only in the ways the conditions allow, that the server's counters agree with what the procedures saw, that the connection limit refuses the surplus clients, and that nothing leaks. |
 
 `test_soak [seed [scale]]` (or `SEED=`/`SCALE=` with make, `-Seed`/`-Scale`
 with PowerShell) chooses the random sequence and multiplies the number of

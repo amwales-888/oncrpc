@@ -7,6 +7,7 @@ liboncrpc is a clean-room C99 implementation of:
   local sockets (Unix domain sockets; named pipes on Windows)
 - **rpcbind versions 3 and 4, port mapper version 2**: RFC 1833 (lookup
   and registration, IPv4 and IPv6)
+- **RPC-with-TLS**: RFC 9289, TLS 1.3 on TCP connections, with OpenSSL 3
 - **The XDR/RPC language**: `.x` files, with a parser and the `oncrpcgen`
   code generator for client stubs, server dispatch and XDR routines
 
@@ -18,7 +19,9 @@ Design rules:
   shares the loop with whatever else your application runs on it.
 - **Your allocator.** The library never calls malloc/realloc/free. All
   memory comes from an `oncRPCAllocator` you supply (`check-alloc` in the
-  makefiles verifies this).
+  makefiles verifies this). The one exception is OpenSSL, which allocates
+  for itself inside TLS; to route that too, call OpenSSL's
+  `CRYPTO_set_mem_functions` before using TLS.
 - **Naming.** Public functions and types are `oncRPC` + CamelCase
   (`oncRPCClientCreate`, `oncRPCXdrInt32`); constants and macros are
   `ONCRPC_` + upper case.
@@ -512,6 +515,71 @@ On Windows the path is a pipe name such as `\\.\pipe\myapp` (written
   returns the path. Clients created with `ONCRPC_PROTO_LOCAL` do not ask
   rpcbind themselves: they connect to the path they are given.
 
+### TLS
+
+RPC-with-TLS (RFC 9289) upgrades a TCP connection to TLS 1.3. The client
+first asks with a NULL call carrying the credential AUTH_TLS; a server that
+agrees answers "STARTTLS" and the TLS handshake follows on the same
+connection. From then on every call and reply on it is encrypted, and the
+usual credentials (AUTH_NONE, AUTH_SYS) travel inside. Programs and `.x`
+files do not change: TLS is set up on the client and server objects.
+
+Each side needs an `oncRPCTlsConfig` with its certificates and the
+certificates it trusts, given as **PEM text** (the library does not read
+files, so that nothing blocks; read them as suits your program):
+
+```c
+/* server: its certificate (then any intermediates) and private key */
+oncRPCTlsConfig *tls;
+oncRPCTlsConfigCreate(&app_alloc, ONCRPC_TLS_SERVER, &tls);
+oncRPCTlsConfigSetCertificate(tls, certPem, keyPem);
+oncRPCServerSetTls(server, tls, 1);     /* 1: refuse calls without TLS */
+oncRPCTlsConfigFree(tls);               /* the server keeps a reference */
+
+/* client: who it trusts to have signed the server's certificate */
+oncRPCTlsConfigCreate(&app_alloc, ONCRPC_TLS_CLIENT, &tls);
+oncRPCTlsConfigAddTrusted(tls, caPem);  /* or oncRPCTlsConfigUseSystemTrust */
+oncRPCClientCreate(loop, &app_alloc, "rpc.example.com", 2049, PROG, VERS,
+                   ONCRPC_PROTO_TCP, NULL, NULL, &client);
+oncRPCClientSetTls(client, tls, NULL);  /* NULL: check the name given above */
+oncRPCTlsConfigFree(tls);
+```
+
+- **Checking the server.** By default a client accepts only a certificate
+  that chains to a trusted one and names the server: the host given to
+  `oncRPCClientCreate`, or the `serverName` given to `oncRPCClientSetTls`
+  (a DNS name, matched against the certificate's names, or an IP address,
+  matched against its addresses). `ONCRPC_TLS_VERIFY_NONE` turns the check
+  off; use it only for testing.
+- **Mutual TLS.** A server set to `ONCRPC_TLS_VERIFY_PEER` asks clients for
+  a certificate, and `ONCRPC_TLS_VERIFY_REQUIRE` turns away those without
+  one; either needs `oncRPCTlsConfigAddTrusted` with the authorities whose
+  client certificates it accepts. The client gives its certificate with
+  `oncRPCTlsConfigSetCertificate`. In a procedure, `oncRPCSvcTlsPeer(req,
+  buf, len)` gives the subject of the client's certificate
+  (`"CN=alice,O=Example"`), and `oncRPCSvcTls(req)` tells whether the
+  request came over TLS at all.
+- **Requiring TLS.** With `required` set, a server refuses requests that
+  did not come over TLS - on TCP connections that were not upgraded, and
+  over UDP - with AUTH_ERROR / AUTH_TOOWEAK. Local sockets are not
+  affected. Without it, TLS is offered to clients that ask.
+- **When it fails.** A client's calls (and its ready callback) fail with
+  `ONCRPC_ERR_TLS`, and `oncRPCClientLastError(clnt)->detail` says why: the
+  server does not offer TLS, its certificate is not trusted or does not
+  name it, the server refused the client's certificate, or no answer came
+  within the client's timeout. As with a failed connection, the next call
+  tries again on a new connection. On the server, `tlsSessions` and
+  `tlsFailures` in `oncRPCServerGetStats` count the outcomes.
+- **Lifetimes.** A configuration may be shared by any number of clients and
+  servers; each keeps it alive while it needs it, so free yours whenever
+  convenient. Changes made to a configuration after it is in use apply to
+  connections made later.
+- **Trust on Windows.** `oncRPCTlsConfigUseSystemTrust` uses OpenSSL's
+  default certificate store, which on Windows is not the Windows
+  certificate store: give the authorities with `oncRPCTlsConfigAddTrusted`.
+
+`examples/10_tls` shows both sides, with mutual TLS.
+
 ### Dispatch without generated code
 
 ```c
@@ -612,7 +680,8 @@ checked once at the end. Use `ONCRPC_XDR_UNBOUNDED` as the maximum for `<>`.
 | `oncRPCClientSetRetry(clnt, ms)` | UDP retransmit interval (default 1000) |
 | `oncRPCClientSetMaxRecord(clnt, bytes)` | largest TCP reply accepted (default 16 MiB) |
 | `oncRPCClientSetAuthNone(clnt)` / `SetAuthSys(...)` / `SetAuthSysDefault(clnt)` | credentials |
-| `oncRPCClientLastError(clnt)` | details of the call being reported |
+| `oncRPCClientSetTls(clnt, cfg, serverName)` | use TLS on the client's TCP connections |
+| `oncRPCClientLastError(clnt)` | details of the call being reported (`detail` for `ONCRPC_ERR_TLS`) |
 | `oncRPCClientData(clnt)` / `oncRPCClientAllocator(clnt)` / `oncRPCClientPending(clnt)` | accessors |
 
 ### rpcbind and the port mapper
@@ -672,6 +741,18 @@ first. `"127.0.0.1.4.1"` and `"::1.4.1"` are port 4 * 256 + 1 = 1025.
 | `oncRPCSvcErrNoProc / ErrDecode / ErrSystem / ErrNoProg / ErrProgVers / ErrAuth` | error replies |
 | `oncRPCSvcPeer(req, buf, len)` | caller address |
 | `oncRPCSvcLocalCred(req, &uid, &gid)` | caller's user and group over a local socket (not on Windows) |
+| `oncRPCServerSetTls(srv, cfg, required)` | offer (or require) TLS on TCP connections |
+| `oncRPCSvcTls(req)` / `oncRPCSvcTlsPeer(req, buf, len)` | whether the request came over TLS; the client certificate's subject |
+
+### TLS configuration
+
+| Function | Description |
+|---|---|
+| `oncRPCTlsConfigCreate(alloc, ONCRPC_TLS_CLIENT or _SERVER, &cfg)` / `oncRPCTlsConfigFree(cfg)` | create; release your reference |
+| `oncRPCTlsConfigSetCertificate(cfg, certPem, keyPem)` | this side's certificate chain and private key |
+| `oncRPCTlsConfigAddTrusted(cfg, pem)` | trust these certificates as issuers |
+| `oncRPCTlsConfigUseSystemTrust(cfg)` | also trust OpenSSL's default store (may read files while checking) |
+| `oncRPCTlsConfigSetVerify(cfg, ONCRPC_TLS_VERIFY_NONE / _PEER / _REQUIRE)` | what to check of the peer |
 
 ### Status codes (`oncRPCStat`)
 
@@ -679,7 +760,8 @@ first. `"127.0.0.1.4.1"` and `"::1.4.1"` are port 4 * 256 + 1 = 1025.
 `_CANTRECV`, `_TIMEDOUT`, `_VERSMISMATCH`, `_AUTHERROR`, `_PROGUNAVAIL`,
 `_PROGVERSMISMATCH`, `_PROCUNAVAIL`, `_CANTDECODEARGS`, `_SYSTEMERROR`,
 `_UNKNOWNHOST`, `_CANTCONNECT`, `_PMAPFAILURE`, `_PROGNOTREGISTERED`,
-`_NOMEM`, `_INVALID`, `_CANCELLED`, `_FAILED`. `oncRPCStrError()` gives text.
+`_NOMEM`, `_INVALID`, `_CANCELLED`, `_FAILED`, `_TLS`. `oncRPCStrError()`
+gives text.
 
 A function that starts an operation returns `ONCRPC_OK` if it started, in
 which case its callback will run exactly once. Any other return value means
@@ -713,8 +795,16 @@ oncRPCXSpecFree(spec);
 
 ## 12. Limits and conformance notes
 
-- **Authentication.** AUTH_NONE and AUTH_SYS on both sides. Servers reject
-  other flavors with `AUTH_REJECTEDCRED`. Reply verifiers are AUTH_NONE.
+- **Authentication.** AUTH_NONE and AUTH_SYS on both sides, and AUTH_TLS
+  for starting TLS. Servers reject other flavors with `AUTH_REJECTEDCRED`.
+  Reply verifiers are AUTH_NONE.
+- **TLS.** RFC 9289 on TCP: TLS 1.3 only, with the ALPN protocol id the RFC
+  registers (offered by clients; a server refuses a client that offers
+  ALPN without it, and accepts one that offers no ALPN at all). Not
+  provided: DTLS for UDP, TLS on local sockets, session resumption, and
+  sending TLS close_notify when a connection is closed (record marking
+  already shows where every message ends). A reply to a request that
+  arrived before the switch to TLS, and is sent after it, is dropped.
 - **Transports.** TCP (RFC 5531 record marking; any number of fragments on
   receive, one per message on send) and UDP (64 KiB datagrams), IPv4 and IPv6;
   local sockets (Unix domain sockets, Windows named pipes) with the same

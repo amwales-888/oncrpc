@@ -14,11 +14,13 @@
 #                                      other systems' builds in build/ are left alone
 #
 # Needs the Xcode Command Line Tools (xcode-select --install) and, from
-# Homebrew:  brew install libuv pkg-config
+# Homebrew:  brew install libuv openssl@3 pkg-config
 #
 # Variables you can override:  CC, CFLAGS, PREFIX, DESTDIR, V=1 (show full
-# commands), ARCHFLAGS (e.g. "-arch arm64 -arch x86_64" for universal
-# binaries, which needs a universal build of libuv as well; see BUILDING.md).
+# commands), OPENSSL_PREFIX (where OpenSSL 3 is; asked of Homebrew by
+# default), ARCHFLAGS (e.g. "-arch arm64 -arch x86_64" for universal
+# binaries, which needs universal builds of libuv and OpenSSL as well; see
+# BUILDING.md).
 #
 # Written for the GNU make 3.81 that comes with macOS: no feature newer than
 # that is used.
@@ -43,7 +45,7 @@ LIBRARY    := liboncrpc.a
 
 SRCDIR      := src
 
-LIB_SOURCES := xdr.c auth.c error.c client.c pmap.c server.c xparse.c xgen.c
+LIB_SOURCES := xdr.c auth.c error.c client.c pmap.c server.c tls.c xparse.c xgen.c
 APP_SOURCES := oncrpcgen.c
 HEADERS     := oncrpc.h xdr.h xspec.h
 ALL_HEADERS := $(HEADERS) internal.h
@@ -52,18 +54,24 @@ ALL_HEADERS := $(HEADERS) internal.h
 # only, no networking) is built separately below.
 RPC_EXAMPLES := 01_add:add 02_strings:greet 03_shapes:shapes 04_lists:lists \
                 05_async:delay 06_portmap:clock 07_errors:secure \
-                09_local:local
+                09_local:local 10_tls:hello
 
-PKGS := libuv
+PKGS := libuv openssl
+
+# Homebrew installs OpenSSL 3 "keg-only" (not on pkg-config's usual path),
+# so ask Homebrew where it is. The path is given to pkg-config in the same
+# command, since make 3.81 does not pass exported variables to $(shell).
+OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null)
+PKG_ENV := PKG_CONFIG_PATH="$(OPENSSL_PREFIX)/lib/pkgconfig:$$PKG_CONFIG_PATH"
 
 # Fail early with a clear message if a dependency is missing.
 ifeq ($(filter clean uninstall,$(MAKECMDGOALS)),)
-  ifneq ($(shell $(PKG_CONFIG) --exists $(PKGS) && echo yes),yes)
-    $(error Missing libuv or pkg-config. With Homebrew: \
-            brew install libuv pkg-config)
+  ifneq ($(shell $(PKG_ENV) $(PKG_CONFIG) --exists $(PKGS) && echo yes),yes)
+    $(error Missing libuv, OpenSSL 3 or pkg-config. With Homebrew: \
+            brew install libuv openssl@3 pkg-config)
   endif
-  PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKGS))
-  PKG_LIBS   := $(shell $(PKG_CONFIG) --libs $(PKGS))
+  PKG_CFLAGS := $(shell $(PKG_ENV) $(PKG_CONFIG) --cflags $(PKGS))
+  PKG_LIBS   := $(shell $(PKG_ENV) $(PKG_CONFIG) --libs $(PKGS))
 endif
 
 # No _POSIX_C_SOURCE here (unlike Makefile-Linux): on macOS it hides the BSD
@@ -99,7 +107,7 @@ EXAMPLE_PROGRAMS := $(foreach e,$(RPC_EXAMPLES),\
                       $(EXDIR)/$(call example_dir,$(e))/client) \
                     $(EXDIR)/08_xdr/xdr_demo
 TEST_PROGRAMS := $(TESTDIR)/test_xdr $(TESTDIR)/test_xspec $(TESTDIR)/test_rpcb $(TESTDIR)/test_gen \
-                 $(TESTDIR)/test_rpc $(TESTDIR)/test_soak
+                 $(TESTDIR)/test_rpc $(TESTDIR)/test_tls $(TESTDIR)/test_soak
 
 # Quiet output; 'make V=1' shows full commands.
 ifeq ($(V),1)
@@ -276,6 +284,13 @@ $(TESTDIR)/test_rpc: tests/test_rpc.c $(TESTDIR)/calc/calc_xdr.o $(TESTDIR)/calc
 	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/calc $(CFLAGS) $(LDFLAGS) -o $@ $< \
 	    $(filter %.o,$^) $(BUILD)/$(LIBRARY) $(LDLIBS)
 
+# test_tls: RPC-with-TLS, with the certificates in tests/tls_certs.h.
+$(TESTDIR)/test_tls: tests/test_tls.c tests/tls_certs.h $(TESTDIR)/calc/calc_xdr.o \
+                     $(TESTDIR)/calc/calc_clnt.o $(TESTDIR)/calc/calc_svc.o $(BUILD)/$(LIBRARY)
+	$(call say,CC,$<)
+	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/calc $(CFLAGS) $(LDFLAGS) -o $@ $< \
+	    $(filter %.o,$^) $(BUILD)/$(LIBRARY) $(LDLIBS)
+
 # test_soak: many clients, a lossy UDP relay and small server limits.
 $(TESTDIR)/test_soak: tests/test_soak.c $(TESTDIR)/calc/calc_xdr.o $(TESTDIR)/calc/calc_clnt.o \
                       $(TESTDIR)/calc/calc_svc.o $(BUILD)/$(LIBRARY)
@@ -295,6 +310,7 @@ check: $(TEST_PROGRAMS) $(EXAMPLE_PROGRAMS) check-alloc
 	$(Q)$(TESTDIR)/test_gen
 	$(Q)$(TESTDIR)/test_rpc
 	$(Q)$(TESTDIR)/test_rpcb
+	$(Q)$(TESTDIR)/test_tls
 	$(Q)sh tests/run_examples.sh $(EXDIR)
 
 # A longer run under a lossy network: 'make soak SEED=7 SCALE=10'.

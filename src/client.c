@@ -1,9 +1,9 @@
 /*
- * client.c - asynchronous RPC client on libuv, over TCP (record marking)
- * and UDP (with retransmission).
+ * client.c - asynchronous RPC client on libuv, over TCP (record marking),
+ * UDP (with retransmission) and local sockets; TCP optionally inside TLS.
  *
  * Life of a client:
- *   [port mapper lookup] -> resolve -> connect -> READY
+ *   [port mapper lookup] -> resolve -> connect -> [STARTTLS -> handshake] -> READY
  * Calls issued before READY are queued. A lost TCP connection fails the
  * calls already sent and is re-established when the next call is made.
  */
@@ -21,6 +21,8 @@ typedef enum cstate {
     CS_RESOLVING,     /* uv_getaddrinfo running */
     CS_IDLE,          /* address known, no connection (TCP) */
     CS_CONNECTING,
+    CS_STARTTLS,      /* asked the server for TLS, waiting for its answer */
+    CS_HANDSHAKE,     /* TLS handshake under way */
     CS_READY,
     CS_RESETTING,     /* closing a broken TCP handle */
     CS_FAILED,        /* resolution or port lookup failed for good */
@@ -107,11 +109,30 @@ struct oncRPCClient {
     oncRPCCloseCb          closeCb;
     void                  *closeData;
     int                    closePending;
+
+    /* TLS (RFC 9289) */
+    oncRPCTlsConfig       *tlsCfg;     /* set: upgrade every TCP connection */
+    char                  *tlsName;    /* what the server's certificate must name */
+    tlsSession            *tls;        /* the current connection's session */
+    uint8_t               *tbuf;       /* bytes as received, before decryption */
+    uint32_t               probeXid;
+    uint64_t               tlsDeadline;
+    char                   tlsErr[192];
 };
 
 static void start_connect(oncRPCClient *c);
 static void schedule(oncRPCClient *c);
 static void send_call(oncRPCClient *c, ccall *k);
+static void tls_failed(oncRPCClient *c, const char *why);
+static int  tls_flush(oncRPCClient *c);
+static void became_ready(oncRPCClient *c);
+
+/* The connection is gone: so is its TLS session. */
+static void drop_tls(oncRPCClient *c)
+{
+    oncRPCIntTlsFree(c->tls);
+    c->tls = NULL;
+}
 
 /* ---- Call list ------------------------------------------------------------ */
 
@@ -217,10 +238,16 @@ static void close_step_done(oncRPCClient *c)
         unlink_call(c, k);
         memset(&c->err, 0, sizeof(c->err));
         c->err.uvError = k->failUv;
+        if (k->fail == ONCRPC_ERR_TLS)
+            c->err.detail = c->tlsErr;
         complete(c, k, k->fail != ONCRPC_OK ? k->fail : ONCRPC_ERR_CANCELLED);
     }
     cb = c->closeCb;
     data = c->closeData;
+    oncRPCIntTlsFree(c->tls);
+    oncRPCIntTlsConfigUnref(c->tlsCfg);
+    oncRPCFree(c->alloc, c->tlsName);
+    oncRPCFree(c->alloc, c->tbuf);
     oncRPCFree(c->alloc, c->host);
     oncRPCFree(c->alloc, c->rbuf);
     oncRPCFree(c->alloc, c->mbuf);
@@ -292,11 +319,17 @@ static void on_timer(uv_timer_t *t)
     if (c->readyPending) {
         c->readyPending = 0;
         c->readyReported = 1;
+        memset(&c->err, 0, sizeof(c->err));
+        c->err.stat = c->readyStat;
+        if (c->readyStat == ONCRPC_ERR_TLS)
+            c->err.detail = c->tlsErr;
         if (c->readyCb)
             c->readyCb(c, c->readyStat, c->data);
         if (c->state == CS_CLOSING)
             return;
     }
+    if ((c->state == CS_STARTTLS || c->state == CS_HANDSHAKE) && now >= c->tlsDeadline)
+        tls_failed(c, "no answer while setting up TLS");
     /* Collect finished calls first: callbacks may add or complete calls. */
     for (k = c->calls; k != NULL; k = next) {
         next = k->next;
@@ -314,6 +347,8 @@ static void on_timer(uv_timer_t *t)
         next = k->next;
         memset(&c->err, 0, sizeof(c->err));
         c->err.uvError = k->failUv;
+        if (k->fail == ONCRPC_ERR_TLS)
+            c->err.detail = c->tlsErr;
         complete(c, k, k->fail != ONCRPC_OK ? k->fail : ONCRPC_ERR_TIMEDOUT);
         if (c->state == CS_CLOSING) {
             /* The callback closed the client: hand the rest to close. */
@@ -344,6 +379,8 @@ static void schedule(oncRPCClient *c)
     now = uv_now(c->loop);
     if (c->readyPending)
         when = now;
+    if ((c->state == CS_STARTTLS || c->state == CS_HANDSHAKE) && c->tlsDeadline < when)
+        when = c->tlsDeadline;
     for (k = c->calls; k != NULL && when > now; k = k->next) {
         if (k->fail != ONCRPC_OK)
             when = now;
@@ -369,6 +406,7 @@ static void reset_connection(oncRPCClient *c, oncRPCStat st, int uverr)
 {
     if (c->state == CS_CLOSING || c->state == CS_RESETTING)
         return;
+    drop_tls(c);
     if (c->ioOpen) {
         c->ioOpen = 0;
         c->ioClosing = 1;
@@ -387,6 +425,17 @@ static void send_call(oncRPCClient *c, ccall *k)
     int r;
     size_t len = k->msglen - (c->proto != ONCRPC_PROTO_UDP ? 0 : 4);
 
+    if (c->tls != NULL) {
+        /* Encrypt; what OpenSSL produces is sent by tls_flush. */
+        k->sent = 1;
+        if (oncRPCIntTlsWrite(c->tls, k->msg, len) != 0 || !tls_flush(c)) {
+            reset_connection(c, ONCRPC_ERR_CANTSEND, 0);
+            return;
+        }
+        oncRPCFree(c->alloc, k->msg);
+        k->msg = NULL;
+        return;
+    }
     w = (cwreq *)oncRPCAlloc(c->alloc, sizeof(*w));
     if (w != NULL)
         w->buf = (uint8_t *)oncRPCRealloc(c->alloc, NULL, len);
@@ -541,6 +590,10 @@ static void on_alloc(uv_handle_t *h, size_t suggested, uv_buf_t *b)
         *b = uv_buf_init((char *)c->rbuf, (unsigned int)c->rcap);
         return;
     }
+    if (c->tls != NULL) {
+        *b = uv_buf_init((char *)c->tbuf, ONCRPC_READ_CHUNK);
+        return;
+    }
     if (c->rcap - c->rlen < ONCRPC_READ_CHUNK &&
         (c->rlen > c->maxRecord + ONCRPC_READ_CHUNK ||
          !oncRPCIntGrow(c->alloc, &c->rbuf, &c->rcap, c->rlen + ONCRPC_READ_CHUNK))) {
@@ -548,6 +601,219 @@ static void on_alloc(uv_handle_t *h, size_t suggested, uv_buf_t *b)
         return;
     }
     *b = uv_buf_init((char *)c->rbuf + c->rlen, (unsigned int)(c->rcap - c->rlen));
+}
+
+/* Hand the complete records in rbuf to handle_reply. */
+static void process_records(oncRPCClient *c)
+{
+    size_t mlen;
+    int r;
+    while (c->state == CS_READY &&
+           (r = oncRPCIntRecordExtract(c->alloc, c->rbuf, &c->rlen, c->maxRecord, &c->mbuf,
+                                       &c->mcap, &mlen)) != 0) {
+        if (r < 0) {
+            reset_connection(c, ONCRPC_ERR_CANTRECV, 0);
+            return;
+        }
+        handle_reply(c, c->mbuf, mlen);
+    }
+}
+
+/* ---- TLS (RFC 9289) ----------------------------------------------------------- */
+
+static void on_tls_written(uv_write_t *req, int status)
+{
+    cwreq *w = (cwreq *)req;
+    oncRPCClient *c = w->c;
+    oncRPCFree(c->alloc, w->buf);
+    oncRPCFree(c->alloc, w);
+    if (status < 0 && status != UV_ECANCELED) {
+        if (c->state == CS_STARTTLS || c->state == CS_HANDSHAKE)
+            tls_failed(c, "the connection failed while setting up TLS");
+        else
+            reset_connection(c, ONCRPC_ERR_CANTSEND, status);
+    }
+}
+
+/* Write buf (len bytes, allocated; ownership passes) to the connection. */
+static int write_raw(oncRPCClient *c, uint8_t *buf, size_t len)
+{
+    cwreq *w = (cwreq *)oncRPCAlloc(c->alloc, sizeof(*w));
+    uv_buf_t b;
+    if (w == NULL) {
+        oncRPCFree(c->alloc, buf);
+        return 0;
+    }
+    w->c = c;
+    w->buf = buf;
+    b = uv_buf_init((char *)buf, (unsigned int)len);
+    if (uv_write(&w->r.w, &c->io.s, &b, 1, on_tls_written) != 0) {
+        oncRPCFree(c->alloc, buf);
+        oncRPCFree(c->alloc, w);
+        return 0;
+    }
+    return 1;
+}
+
+/* Send whatever TLS has produced. Returns 0 on failure. */
+static int tls_flush(oncRPCClient *c)
+{
+    uint8_t *buf;
+    size_t len;
+    int r;
+    while (c->tls != NULL && (r = oncRPCIntTlsOutput(c->tls, c->alloc, &buf, &len)) != 0) {
+        if (r < 0 || !write_raw(c, buf, len))
+            return 0;
+    }
+    return 1;
+}
+
+/* TLS could not be set up on this connection: like a failed connection,
+ * every waiting call fails (with ONCRPC_ERR_TLS); the next call tries
+ * again on a new connection. */
+static void tls_failed(oncRPCClient *c, const char *why)
+{
+    snprintf(c->tlsErr, sizeof(c->tlsErr), "%s", why);
+    drop_tls(c);
+    if (c->ioOpen) {
+        c->ioOpen = 0;
+        c->ioClosing = 1;
+        uv_close(&c->io.h, on_io_closed);
+        c->state = CS_RESETTING;
+    } else {
+        c->state = CS_IDLE;
+    }
+    report_ready(c, ONCRPC_ERR_TLS);
+    fail_calls(c, ONCRPC_ERR_TLS, 0, 0);
+}
+
+/* Ask the server for TLS: a NULL call with the AUTH_TLS credential. */
+static void start_tls(oncRPCClient *c)
+{
+    static const uint32_t tail[] = {
+        0,                  /* procedure 0 */
+        ONCRPC_AUTH_TLS, 0, /* credential: AUTH_TLS, empty */
+        ONCRPC_AUTH_NONE, 0 /* verifier */
+    };
+    uint8_t *msg = (uint8_t *)oncRPCRealloc(c->alloc, NULL, 44);
+    size_t i;
+
+    if (msg == NULL) {
+        tls_failed(c, "out of memory");
+        return;
+    }
+    c->probeXid = c->xid++;
+    oncRPCIntPutBe32(msg, 0x80000000u | 40u);   /* record mark: last fragment, 40 bytes */
+    oncRPCIntPutBe32(msg + 4, c->probeXid);
+    oncRPCIntPutBe32(msg + 8, ONCRPC_MSG_CALL);
+    oncRPCIntPutBe32(msg + 12, ONCRPC_PROTOCOL_VERSION);
+    oncRPCIntPutBe32(msg + 16, c->prog);
+    oncRPCIntPutBe32(msg + 20, c->vers);
+    for (i = 0; i < sizeof(tail) / sizeof(tail[0]); i++)
+        oncRPCIntPutBe32(msg + 24 + 4 * i, tail[i]);
+    c->state = CS_STARTTLS;
+    c->tlsDeadline = uv_now(c->loop) + c->timeoutMs;
+    if (!write_raw(c, msg, 44)) {
+        tls_failed(c, "could not send the TLS request");
+        return;
+    }
+    schedule(c);
+}
+
+/* Whether the reply agrees to TLS: accepted, SUCCESS, and the verifier
+ * AUTH_NONE with the body "STARTTLS". Otherwise *why says what it was. */
+static int starttls_agreed(oncRPCClient *c, const uint8_t *buf, size_t len, const char **why)
+{
+    oncRPCXdr x;
+    oncRPCOpaqueAuth verf;
+    uint32_t xid, mtype, rstat, astat;
+
+    *why = "the server sent an unexpected answer to the TLS request";
+    oncRPCXdrInitDecode(&x, c->alloc, buf, len);
+    if (!oncRPCXdrUint32(&x, &xid) || !oncRPCXdrUint32(&x, &mtype) || xid != c->probeXid ||
+        mtype != ONCRPC_MSG_REPLY || !oncRPCXdrUint32(&x, &rstat))
+        return 0;
+    if (rstat != ONCRPC_MSG_ACCEPTED) {
+        *why = "the server refused TLS";
+        return 0;
+    }
+    if (!oncRPCIntXdrOpaqueAuth(&x, &verf) || !oncRPCXdrUint32(&x, &astat))
+        return 0;
+    if (astat != ONCRPC_ACCEPT_SUCCESS || verf.flavor != ONCRPC_AUTH_NONE ||
+        verf.len != ONCRPC_STARTTLS_LEN ||
+        memcmp(verf.body, ONCRPC_STARTTLS, ONCRPC_STARTTLS_LEN) != 0) {
+        *why = "the server does not offer TLS";
+        return 0;
+    }
+    return 1;
+}
+
+/* Decrypt what has arrived and act on it. */
+static void tls_pump(oncRPCClient *c)
+{
+    size_t got;
+    int r;
+
+    if (c->state == CS_HANDSHAKE) {
+        r = oncRPCIntTlsHandshake(c->tls);
+        if (!tls_flush(c)) {
+            tls_failed(c, "could not send TLS data");
+            return;
+        }
+        if (r < 0) {
+            tls_failed(c, oncRPCIntTlsError(c->tls));
+            return;
+        }
+        if (r == 0)
+            return;
+        became_ready(c);   /* sends the queued calls, encrypted */
+    }
+    while (c->state == CS_READY && c->tls != NULL) {
+        if (c->rcap - c->rlen < ONCRPC_READ_CHUNK &&
+            (c->rlen > c->maxRecord + ONCRPC_READ_CHUNK ||
+             !oncRPCIntGrow(c->alloc, &c->rbuf, &c->rcap, c->rlen + ONCRPC_READ_CHUNK))) {
+            reset_connection(c, ONCRPC_ERR_CANTRECV, UV_ENOBUFS);
+            return;
+        }
+        r = oncRPCIntTlsRead(c->tls, c->rbuf + c->rlen, c->rcap - c->rlen, &got);
+        if (r < 0) {
+            /* The calls sent fail with the TLS reason - such as the server
+             * refusing our certificate, which TLS 1.3 reports only after
+             * the client's side of the handshake is done. */
+            snprintf(c->tlsErr, sizeof(c->tlsErr), "%s", oncRPCIntTlsError(c->tls));
+            reset_connection(c, ONCRPC_ERR_TLS, 0);
+            return;
+        }
+        if (r == 0)
+            break;
+        c->rlen += got;
+    }
+    if (c->tls != NULL && !tls_flush(c)) {
+        reset_connection(c, ONCRPC_ERR_CANTSEND, 0);
+        return;
+    }
+    process_records(c);
+}
+
+/* The server agreed: start the handshake. */
+static void begin_handshake(oncRPCClient *c)
+{
+    if (c->tbuf == NULL)
+        c->tbuf = (uint8_t *)oncRPCRealloc(c->alloc, NULL, ONCRPC_READ_CHUNK);
+    c->tls = c->tbuf != NULL ? oncRPCIntTlsStart(c->tlsCfg, c->tlsName) : NULL;
+    if (c->tls == NULL) {
+        tls_failed(c, "could not start TLS");
+        return;
+    }
+    c->state = CS_HANDSHAKE;
+    /* Nothing should follow the answer before the handshake, but pass on
+     * whatever did. */
+    if (c->rlen > 0 && oncRPCIntTlsFeed(c->tls, c->rbuf, c->rlen) != 0) {
+        tls_failed(c, oncRPCIntTlsError(c->tls));
+        return;
+    }
+    c->rlen = 0;
+    tls_pump(c);
 }
 
 static void on_tcp_read(uv_stream_t *s, ssize_t nread, const uv_buf_t *b)
@@ -558,19 +824,36 @@ static void on_tcp_read(uv_stream_t *s, ssize_t nread, const uv_buf_t *b)
     (void)b;
 
     if (nread < 0) {
-        reset_connection(c, ONCRPC_ERR_CANTRECV, (int)nread);
+        if (c->state == CS_STARTTLS || c->state == CS_HANDSHAKE)
+            tls_failed(c, "the server closed the connection while setting up TLS");
+        else
+            reset_connection(c, ONCRPC_ERR_CANTRECV, (int)nread);
+        return;
+    }
+    if (nread == 0)
+        return;
+    if (c->tls != NULL) {
+        if (oncRPCIntTlsFeed(c->tls, c->tbuf, (size_t)nread) != 0) {
+            reset_connection(c, ONCRPC_ERR_CANTRECV, UV_ENOMEM);
+            return;
+        }
+        tls_pump(c);
         return;
     }
     c->rlen += (size_t)nread;
-    while (c->state == CS_READY &&
-           (r = oncRPCIntRecordExtract(c->alloc, c->rbuf, &c->rlen, c->maxRecord, &c->mbuf,
-                                       &c->mcap, &mlen)) != 0) {
-        if (r < 0) {
-            reset_connection(c, ONCRPC_ERR_CANTRECV, 0);
-            return;
-        }
-        handle_reply(c, c->mbuf, mlen);
+    if (c->state == CS_STARTTLS) {
+        const char *why;
+        r = oncRPCIntRecordExtract(c->alloc, c->rbuf, &c->rlen, c->maxRecord, &c->mbuf, &c->mcap,
+                                   &mlen);
+        if (r < 0)
+            tls_failed(c, "the server sent an unexpected answer to the TLS request");
+        else if (r > 0 && !starttls_agreed(c, c->mbuf, mlen, &why))
+            tls_failed(c, why);
+        else if (r > 0)
+            begin_handshake(c);
+        return;
     }
+    process_records(c);
 }
 
 static void on_udp_recv(uv_udp_t *u, ssize_t nread, const uv_buf_t *b,
@@ -593,6 +876,7 @@ static void on_udp_recv(uv_udp_t *u, ssize_t nread, const uv_buf_t *b,
 static void connect_failed(oncRPCClient *c, int uverr)
 {
     oncRPCStat st = oncRPCIntUvStat(uverr, ONCRPC_ERR_CANTCONNECT);
+    drop_tls(c);
     if (c->ioOpen) {
         c->ioOpen = 0;
         c->ioClosing = 1;
@@ -630,7 +914,10 @@ static void on_tcp_connected(uv_connect_t *req, int status)
         connect_failed(c, r);
         return;
     }
-    became_ready(c);
+    if (c->tlsCfg != NULL && c->proto == ONCRPC_PROTO_TCP)
+        start_tls(c);
+    else
+        became_ready(c);
 }
 
 static void start_connect(oncRPCClient *c)
@@ -924,6 +1211,28 @@ void oncRPCClientSetMaxRecord(oncRPCClient *c, size_t bytes)
 {
     if (c && bytes > 0)
         c->maxRecord = bytes;
+}
+
+oncRPCStat oncRPCClientSetTls(oncRPCClient *c, oncRPCTlsConfig *cfg, const char *serverName)
+{
+    char *name;
+
+    if (c == NULL || cfg == NULL || oncRPCIntTlsConfigIsServer(cfg) ||
+        c->proto != ONCRPC_PROTO_TCP)
+        return ONCRPC_ERR_INVALID;
+    /* Only before a connection is up (it is upgraded as soon as it is). */
+    if (c->state != CS_PMAP && c->state != CS_RESOLVING && c->state != CS_IDLE &&
+        c->state != CS_CONNECTING)
+        return ONCRPC_ERR_INVALID;
+    name = oncRPCStrdup(c->alloc, serverName != NULL ? serverName : c->host);
+    if (name == NULL)
+        return ONCRPC_ERR_NOMEM;
+    oncRPCIntTlsConfigRef(cfg);
+    oncRPCIntTlsConfigUnref(c->tlsCfg);
+    oncRPCFree(c->alloc, c->tlsName);
+    c->tlsCfg = cfg;
+    c->tlsName = name;
+    return ONCRPC_OK;
 }
 
 const oncRPCError *oncRPCClientLastError(const oncRPCClient *c)

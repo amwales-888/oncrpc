@@ -30,6 +30,13 @@ typedef struct slistener {
     struct slistener *next;
 } slistener;
 
+/* The subject of a verified client certificate, shared by a connection and
+ * its requests (which may outlive it). */
+typedef struct tlsPeer {
+    size_t refs;
+    char   subject[1];
+} tlsPeer;
+
 typedef struct sconn {
     union {
         uv_handle_t h;
@@ -51,6 +58,12 @@ typedef struct sconn {
     uint32_t                idleTicks;    /* housekeeping ticks with no traffic */
     int                     paused;       /* reading stopped by a request limit */
     int                     closing;
+    /* TLS (RFC 9289) */
+    int                     startTls;     /* agreed to TLS: switch after this record */
+    int                     tlsState;     /* 0 plain, 1 handshake, 2 established */
+    tlsSession             *tls;
+    uint8_t                *tbuf;         /* bytes as received, before decryption */
+    tlsPeer                *tlsPeer;      /* verified client certificate */
     struct sconn           *next;
     struct sconn           *prev;
 } sconn;
@@ -102,6 +115,8 @@ typedef struct svcCall {
     int                     finished;
     oncRPCAuthSysParams     sys;
     drcEntry               *drc;       /* UDP duplicate cache entry, if any */
+    int                     tls;       /* arrived over TLS */
+    tlsPeer                *tlsPeer;   /* its verified client certificate */
     int                     hasCred;   /* local: the caller's uid and gid */
     uint32_t                uid;
     uint32_t                gid;
@@ -134,6 +149,8 @@ struct oncRPCServer {
     size_t                 pausedConns;
     uint8_t               *msg;           /* reassembled TCP record */
     size_t                 msgcap;
+    oncRPCTlsConfig       *tlsCfg;        /* offer TLS on TCP connections */
+    int                    tlsRequired;
     uv_timer_t             tick;          /* idle connections, cache expiry */
     uint64_t               tickMs;        /* its period; 0 when stopped */
     uv_idle_t              resume;        /* restarts paused connections */
@@ -440,6 +457,7 @@ static void maybe_finish_close(oncRPCServer *s)
     }
     cb = s->closeCb;
     data = s->closeData;
+    oncRPCIntTlsConfigUnref(s->tlsCfg);
     oncRPCFree(s->alloc, s->msg);
     oncRPCFree(s->alloc, s);
     if (cb)
@@ -447,6 +465,23 @@ static void maybe_finish_close(oncRPCServer *s)
 }
 
 /* ---- Request lifecycle -------------------------------------------------------- */
+
+static tlsPeer *peer_new(oncRPCServer *s, const char *subject)
+{
+    size_t n = strlen(subject);
+    tlsPeer *p = (tlsPeer *)oncRPCAlloc(s->alloc, sizeof(*p) + n);
+    if (p != NULL) {
+        p->refs = 1;
+        memcpy(p->subject, subject, n + 1);
+    }
+    return p;
+}
+
+static void peer_unref(oncRPCServer *s, tlsPeer *p)
+{
+    if (p != NULL && --p->refs == 0)
+        oncRPCFree(s->alloc, p);
+}
 
 static void release(svcCall *r)
 {
@@ -458,6 +493,7 @@ static void release(svcCall *r)
     }
     if (r->drc != NULL)   /* finished without a reply: forget the request */
         drc_remove(s, r->drc);
+    peer_unref(s, r->tlsPeer);
     if (r->conn != NULL) {
         sconn *c = r->conn;
         if (r->prev)
@@ -502,6 +538,43 @@ static void on_sent(uv_udp_send_t *req, int status)
     on_written((uv_write_t *)(void *)req, status);
 }
 
+static void conn_close(sconn *c);
+
+/* Write buf (owned; freed when done) to a connection as it is. */
+static int conn_write_raw(sconn *c, uint8_t *buf, size_t len)
+{
+    oncRPCServer *s = c->srv;
+    swreq *w = (swreq *)oncRPCAlloc(s->alloc, sizeof(*w));
+    uv_buf_t b;
+    if (w == NULL) {
+        oncRPCFree(s->alloc, buf);
+        return 0;
+    }
+    w->srv = s;
+    w->buf = buf;
+    b = uv_buf_init((char *)buf, (unsigned int)len);
+    if (uv_write(&w->r.w, &c->io.s, &b, 1, on_written) != 0) {
+        oncRPCFree(s->alloc, buf);
+        oncRPCFree(s->alloc, w);
+        return 0;
+    }
+    s->activeOps++;
+    return 1;
+}
+
+/* Send whatever TLS has produced for a connection. Returns 0 on failure. */
+static int conn_tls_flush(sconn *c)
+{
+    uint8_t *buf;
+    size_t len;
+    int r;
+    while (c->tls != NULL && (r = oncRPCIntTlsOutput(c->tls, c->srv->alloc, &buf, &len)) != 0) {
+        if (r < 0 || !conn_write_raw(c, buf, len))
+            return 0;
+    }
+    return 1;
+}
+
 /* Transmit an encoded reply (4 bytes reserved for the record mark). */
 static void transmit(svcCall *r, uint8_t *buf, size_t len)
 {
@@ -509,6 +582,21 @@ static void transmit(svcCall *r, uint8_t *buf, size_t len)
     swreq *w;
     uv_buf_t b;
     int rc;
+
+    if (!s->closing && r->pub.proto != ONCRPC_PROTO_UDP && r->conn != NULL &&
+        !r->conn->closing && r->conn->tls != NULL) {
+        /* Encrypted. (A reply for a request that came before the switch to
+         * TLS cannot be sent while the handshake runs, and is dropped.) */
+        sconn *c = r->conn;
+        int ok = c->tlsState == 2;
+        oncRPCIntPutBe32(buf, (uint32_t)(len - 4) | ONCRPC_LAST_FRAGMENT);
+        if (ok)
+            ok = oncRPCIntTlsWrite(c->tls, buf, len) == 0;
+        oncRPCFree(s->alloc, buf);
+        if (c->tlsState == 2 && (!ok || !conn_tls_flush(c)))
+            conn_close(c);
+        return;
+    }
 
     if (s->closing || (r->pub.proto != ONCRPC_PROTO_UDP && (r->conn == NULL || r->conn->closing)) ||
         (r->pub.proto == ONCRPC_PROTO_UDP && r->lis == NULL) ||
@@ -634,6 +722,23 @@ static void reply_denied(svcCall *r, uint32_t rej, uint32_t a, uint32_t b)
     }
 }
 
+/* Agree to TLS (RFC 9289): accepted, SUCCESS, verifier AUTH_NONE with the
+ * body "STARTTLS", no results. Sent in the clear, before the switch. */
+static void reply_starttls(svcCall *r)
+{
+    oncRPCXdr x;
+    uint8_t body[ONCRPC_STARTTLS_LEN];
+    memcpy(body, ONCRPC_STARTTLS, ONCRPC_STARTTLS_LEN);
+    if (begin_reply(r, &x, ONCRPC_MSG_ACCEPTED) && put_u32(&x, ONCRPC_AUTH_NONE) &&
+        put_u32(&x, ONCRPC_STARTTLS_LEN) && oncRPCXdrOpaque(&x, body, ONCRPC_STARTTLS_LEN) &&
+        put_u32(&x, ONCRPC_ACCEPT_SUCCESS)) {
+        send_and_finish(r, &x);
+    } else {
+        oncRPCXdrDestroy(&x);
+        finish(r);
+    }
+}
+
 int oncRPCSvcReply(oncRPCSvcReq *req, oncRPCXdrProc xres, const void *res)
 {
     svcCall *r = ONCRPC_REQ(req);
@@ -748,6 +853,38 @@ int oncRPCSvcPeer(const oncRPCSvcReq *req, char *buf, size_t len)
     return -1;
 }
 
+int oncRPCSvcTls(const oncRPCSvcReq *req)
+{
+    const svcCall *r = (const svcCall *)(const void *)req;
+    return r != NULL && r->tls;
+}
+
+int oncRPCSvcTlsPeer(const oncRPCSvcReq *req, char *buf, size_t len)
+{
+    const svcCall *r = (const svcCall *)(const void *)req;
+    size_t n;
+    if (r == NULL || r->tlsPeer == NULL || buf == NULL || len == 0)
+        return -1;
+    n = strlen(r->tlsPeer->subject);
+    if (n >= len)
+        n = len - 1;
+    memcpy(buf, r->tlsPeer->subject, n);
+    buf[n] = '\0';
+    return 0;
+}
+
+oncRPCStat oncRPCServerSetTls(oncRPCServer *s, oncRPCTlsConfig *cfg, int required)
+{
+    if (s == NULL || cfg == NULL || s->closing || !oncRPCIntTlsConfigIsServer(cfg) ||
+        !oncRPCIntTlsConfigHasCert(cfg))
+        return ONCRPC_ERR_INVALID;
+    oncRPCIntTlsConfigRef(cfg);
+    oncRPCIntTlsConfigUnref(s->tlsCfg);
+    s->tlsCfg = cfg;
+    s->tlsRequired = required != 0;
+    return ONCRPC_OK;
+}
+
 int oncRPCSvcLocalCred(const oncRPCSvcReq *req, uint32_t *uid, uint32_t *gid)
 {
     const svcCall *r = (const svcCall *)(const void *)req;
@@ -823,6 +960,28 @@ static int handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCPr
         return 1;
     }
     r->pub.credFlavor = cred.flavor;
+    if (cred.flavor == ONCRPC_AUTH_TLS) {
+        /* A request to start TLS: a NULL call on a TCP connection not yet
+         * upgraded, to a server that offers TLS. */
+        if (conn != NULL && conn->proto == ONCRPC_PROTO_TCP && s->tlsCfg != NULL &&
+            conn->tlsState == 0 && !conn->startTls && r->pub.proc == 0) {
+            reply_starttls(r);
+            conn->startTls = 1;
+        } else {
+            reply_denied(r, ONCRPC_REJ_AUTH_ERROR, ONCRPC_AUTH_REJECTEDCRED, 0);
+        }
+        return 1;
+    }
+    if (conn != NULL && conn->tlsState == 2) {
+        r->tls = 1;
+        r->tlsPeer = conn->tlsPeer;
+        if (r->tlsPeer != NULL)
+            r->tlsPeer->refs++;
+    }
+    if (s->tlsRequired && !r->tls && proto != ONCRPC_PROTO_LOCAL) {
+        reply_denied(r, ONCRPC_REJ_AUTH_ERROR, ONCRPC_AUTH_TOOWEAK, 0);
+        return 1;
+    }
     if (cred.flavor == ONCRPC_AUTH_SYS) {
         oncRPCXdr ax;
         oncRPCXdrInitDecode(&ax, NULL, cred.body, cred.len);
@@ -872,6 +1031,9 @@ static void on_conn_closed(uv_handle_t *h)
 {
     sconn *c = (sconn *)h->data;
     oncRPCServer *s = c->srv;
+    oncRPCIntTlsFree(c->tls);
+    peer_unref(s, c->tlsPeer);
+    oncRPCFree(s->alloc, c->tbuf);
     oncRPCFree(s->alloc, c->buf);
     oncRPCFree(s->alloc, c);
     s->activeCloses--;
@@ -910,6 +1072,10 @@ static void on_conn_alloc(uv_handle_t *h, size_t suggested, uv_buf_t *b)
     sconn *c = (sconn *)h->data;
     oncRPCServer *s = c->srv;
     (void)suggested;
+    if (c->tls != NULL) {
+        *b = uv_buf_init((char *)c->tbuf, ONCRPC_READ_CHUNK);
+        return;
+    }
     if (c->cap - c->len < ONCRPC_READ_CHUNK &&
         (c->len > s->lim.maxRecord + ONCRPC_READ_CHUNK ||
          !oncRPCIntGrow(s->alloc, &c->buf, &c->cap, c->len + ONCRPC_READ_CHUNK))) {
@@ -918,6 +1084,8 @@ static void on_conn_alloc(uv_handle_t *h, size_t suggested, uv_buf_t *b)
     }
     *b = uv_buf_init((char *)c->buf + c->len, (unsigned int)(c->cap - c->len));
 }
+
+static void conn_start_tls(sconn *c);
 
 /* Dispatch the complete records buffered for a connection, pausing it when a
  * request limit is reached. */
@@ -941,7 +1109,81 @@ static void conn_process(sconn *c)
             return;
         }
         (void)handle_call(s, s->msg, mlen, c->proto, c, NULL, &c->peer, NULL);
+        if (c->startTls && c->tlsState == 0) {
+            conn_start_tls(c);
+            return;
+        }
     }
+}
+
+/* Decrypt what has arrived on a TLS connection and act on it. */
+static void conn_tls_pump(sconn *c)
+{
+    oncRPCServer *s = c->srv;
+    size_t got;
+    int r;
+
+    if (c->tlsState == 1) {
+        r = oncRPCIntTlsHandshake(c->tls);
+        if (!conn_tls_flush(c) || r < 0) {
+            s->stats.tlsFailures++;
+            conn_close(c);
+            return;
+        }
+        if (r == 0)
+            return;
+        c->tlsState = 2;
+        s->stats.tlsSessions++;
+        {
+            char subject[256];
+            if (oncRPCIntTlsPeerSubject(c->tls, subject, sizeof(subject)) == 0)
+                c->tlsPeer = peer_new(s, subject);
+        }
+    }
+    for (;;) {
+        if (c->cap - c->len < ONCRPC_READ_CHUNK &&
+            (c->len > s->lim.maxRecord + ONCRPC_READ_CHUNK ||
+             !oncRPCIntGrow(s->alloc, &c->buf, &c->cap, c->len + ONCRPC_READ_CHUNK))) {
+            conn_close(c);
+            return;
+        }
+        r = oncRPCIntTlsRead(c->tls, c->buf + c->len, c->cap - c->len, &got);
+        if (r < 0) {
+            conn_close(c);
+            return;
+        }
+        if (r == 0)
+            break;
+        c->len += got;
+    }
+    if (!conn_tls_flush(c)) {
+        conn_close(c);
+        return;
+    }
+    conn_process(c);
+}
+
+/* The client was told STARTTLS: from here on the connection is TLS. */
+static void conn_start_tls(sconn *c)
+{
+    oncRPCServer *s = c->srv;
+
+    c->tbuf = (uint8_t *)oncRPCRealloc(s->alloc, NULL, ONCRPC_READ_CHUNK);
+    c->tls = c->tbuf != NULL ? oncRPCIntTlsStart(s->tlsCfg, NULL) : NULL;
+    if (c->tls == NULL) {
+        s->stats.tlsFailures++;
+        conn_close(c);
+        return;
+    }
+    c->tlsState = 1;
+    /* Bytes already read past the request belong to the handshake. */
+    if (c->len > 0 && oncRPCIntTlsFeed(c->tls, c->buf, c->len) != 0) {
+        s->stats.tlsFailures++;
+        conn_close(c);
+        return;
+    }
+    c->len = 0;
+    conn_tls_pump(c);
 }
 
 static void on_conn_read(uv_stream_t *st, ssize_t nread, const uv_buf_t *b)
@@ -950,13 +1192,23 @@ static void on_conn_read(uv_stream_t *st, ssize_t nread, const uv_buf_t *b)
     (void)b;
 
     if (nread < 0) {
+        if (c->tlsState == 1)
+            c->srv->stats.tlsFailures++;
         conn_close(c);
         return;
     }
     if (nread == 0)
         return;
-    c->len += (size_t)nread;
     c->idleTicks = 0;
+    if (c->tls != NULL) {
+        if (oncRPCIntTlsFeed(c->tls, c->tbuf, (size_t)nread) != 0) {
+            conn_close(c);
+            return;
+        }
+        conn_tls_pump(c);
+        return;
+    }
+    c->len += (size_t)nread;
     conn_process(c);
 }
 

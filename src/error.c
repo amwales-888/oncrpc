@@ -32,6 +32,7 @@ const char *oncRPCStrError(oncRPCStat stat)
     case ONCRPC_ERR_INVALID:            return "invalid argument";
     case ONCRPC_ERR_CANCELLED:          return "cancelled";
     case ONCRPC_ERR_FAILED:             return "failed";
+    case ONCRPC_ERR_TLS:                return "TLS failed";
     }
     return "unknown error";
 }

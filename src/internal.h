@@ -81,6 +81,34 @@ void oncRPCIntRpcbCancel(rpcbOp *op, oncRPCCloseCb done, void *data);
 void oncRPCIntClientSetVersion(oncRPCClient *c, uint32_t vers);
 int  oncRPCIntClientFamily(const oncRPCClient *c);
 
+/*
+ * TLS (tls.c). A session wraps one connection: feed it the bytes received,
+ * drive the handshake, read and write plaintext, and send whatever
+ * oncRPCIntTlsOutput hands back (allocated with alloc; the caller frees it).
+ */
+typedef struct tlsSession tlsSession;
+void        oncRPCIntTlsConfigRef(oncRPCTlsConfig *cfg);
+void        oncRPCIntTlsConfigUnref(oncRPCTlsConfig *cfg);
+int         oncRPCIntTlsConfigIsServer(const oncRPCTlsConfig *cfg);
+int         oncRPCIntTlsConfigHasCert(const oncRPCTlsConfig *cfg);
+/* serverName: what the server's certificate must name (clients only). */
+tlsSession *oncRPCIntTlsStart(oncRPCTlsConfig *cfg, const char *serverName);
+void        oncRPCIntTlsFree(tlsSession *t);
+int         oncRPCIntTlsFeed(tlsSession *t, const uint8_t *data, size_t len);  /* 0, or -1 */
+int         oncRPCIntTlsHandshake(tlsSession *t);         /* 1 done, 0 not yet, -1 failed */
+/* 1: *got bytes read; 0: nothing more for now; -1: closed or failed */
+int         oncRPCIntTlsRead(tlsSession *t, uint8_t *buf, size_t cap, size_t *got);
+int         oncRPCIntTlsWrite(tlsSession *t, const uint8_t *data, size_t len); /* 0, or -1 */
+/* 1: *buf holds *len bytes to send; 0: nothing to send; -1: out of memory */
+int         oncRPCIntTlsOutput(tlsSession *t, const oncRPCAllocator *alloc, uint8_t **buf,
+                               size_t *len);
+const char *oncRPCIntTlsError(const tlsSession *t);
+int         oncRPCIntTlsPeerSubject(tlsSession *t, char *buf, size_t len);   /* 0, or -1 */
+
+/* The verifier body a server sends to agree to TLS (RFC 9289). */
+#define ONCRPC_STARTTLS     "STARTTLS"
+#define ONCRPC_STARTTLS_LEN 8u
+
 /* Map a libuv error to a library status. */
 oncRPCStat oncRPCIntUvStat(int uverr, oncRPCStat fallback);
 

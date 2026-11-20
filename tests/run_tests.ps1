@@ -3,7 +3,7 @@
     Runs liboncrpc's tests and examples from a Visual Studio build.
 
 .DESCRIPTION
-    Runs test_xdr, test_xspec, test_gen, test_rpc and test_rpcb, then each example: the
+    Runs test_xdr, test_xspec, test_gen, test_rpc, test_rpcb and test_tls, then each example: the
     example's server is started on a test port, its client is run against it,
     and the server is stopped. 06_portmap is skipped, as Windows has no port
     mapper (rpcbind); 09_local uses a named pipe. With -Soak, test_soak runs as well: many clients
@@ -70,7 +70,7 @@ function Program([string]$name) {
 
 # ---- Tests --------------------------------------------------------------------
 
-foreach ($test in 'test_xdr', 'test_xspec', 'test_gen', 'test_rpc', 'test_rpcb') {
+foreach ($test in 'test_xdr', 'test_xspec', 'test_gen', 'test_rpc', 'test_rpcb', 'test_tls') {
     Write-Host "== $test"
     & (Program $test)
     if ($LASTEXITCODE -ne 0) {
@@ -128,6 +128,24 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "-- 09_local: ok"
 } else {
     Write-Host "-- 09_local: FAILED (server log follows)"
+    Get-Content $log | Write-Host
+    $failed = $true
+}
+Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+$server.WaitForExit()
+
+Write-Host "== 10_tls"
+$port = $BasePort + 10
+$certs = (Resolve-Path (Join-Path $PSScriptRoot (Join-Path '..' (Join-Path 'examples' (Join-Path '10_tls' 'certs'))))).Path
+$log = Join-Path $BinDir "10_tls_server.log"
+$server = Start-Process -FilePath (Program '10_tls_server') -ArgumentList "$port", "`"$certs`"" `
+                        -NoNewWindow -PassThru -RedirectStandardOutput $log
+Start-Sleep -Milliseconds 500
+& (Program '10_tls_client') 127.0.0.1 $port $certs
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "-- 10_tls: ok"
+} else {
+    Write-Host "-- 10_tls: FAILED (server log follows)"
     Get-Content $log | Write-Host
     $failed = $true
 }

@@ -14,11 +14,13 @@ There is one makefile per system: `Makefile-Linux` (GNU make),
 
 libuv does almost all of the platform work. The only platform-specific code
 in liboncrpc reads the process's identity for AUTH_SYS credentials
-(`oncRPCClientSetAuthSysDefault()` in `src/client.c`, `#ifndef _WIN32`), and
-`src/internal.h` asks glibc for POSIX declarations on Linux (below).
+(`oncRPCClientSetAuthSysDefault()` in `src/client.c`, `#ifndef _WIN32`) and
+a local socket peer's (`src/server.c`), and `src/internal.h` asks glibc for
+POSIX declarations on Linux (below).
 
-Dependency: **libuv** (1.27 or later). `oncrpcgen` and the XDR-only parts of
-the library do not need it.
+Dependencies: **libuv** (1.27 or later) and **OpenSSL 3** (for TLS,
+`src/tls.c`). `oncrpcgen` and the XDR-only parts of the library need
+neither.
 
 ## What gets built
 
@@ -32,12 +34,12 @@ the library do not need it.
 
 Visual Studio puts every program in `build\x64\<Configuration>`, named after
 its project (`oncrpcgen.exe`, `01_add_server.exe`, `01_add_client.exe`, ...,
-`08_xdr_demo.exe`, `test_rpc.exe`, `test_soak.exe`); see below.
+`08_xdr_demo.exe`, `test_rpc.exe`, `test_tls.exe`, `test_soak.exe`); see below.
 
 ## Linux (GNU make)
 
 ```sh
-sudo apt install build-essential pkg-config libuv1-dev   # Debian/Ubuntu
+sudo apt install build-essential pkg-config libuv1-dev libssl-dev   # Debian/Ubuntu
 make -f Makefile-Linux            # library, oncrpcgen and the examples in build/linux/release
 make -f Makefile-Linux check      # run the tests and every example (see "Tests" below)
 make -f Makefile-Linux debug      # AddressSanitizer + UBSan build in build/linux/debug
@@ -72,8 +74,9 @@ kill %1
 
 ## FreeBSD (the system's make)
 
-FreeBSD 13 or later. libuv comes from packages; the compiler is the system's
-`cc` (clang).
+FreeBSD 13 or later. libuv comes from packages; OpenSSL 3 comes with the
+base system (FreeBSD 14 and later; on 13, `pkg install openssl` and see
+`OPENSSLBASE` below). The compiler is the system's `cc` (clang).
 
 ```sh
 pkg install libuv pkgconf                 # as root
@@ -87,10 +90,13 @@ make -f Makefile-FreeBSD clean            # removes build/freebsd only
 ```
 
 Variables: `CC`, `CFLAGS`, `PREFIX`, `DESTDIR`, `V=1` (show the full
-commands) and `LOCALBASE` (where packages are, `/usr/local`).
-Makefile-FreeBSD is written for FreeBSD's make (bmake); if you prefer GNU
-make, `pkg install gmake` and `gmake -f Makefile-Linux` also works, as that
-file only needs pkg-config to find libuv.
+commands), `LOCALBASE` (where packages are, `/usr/local`) and
+`OPENSSLBASE` to build against OpenSSL from packages instead of the base
+system (`make -f Makefile-FreeBSD OPENSSLBASE=/usr/local`; the programs then
+find it at run time through an rpath). Makefile-FreeBSD is written for
+FreeBSD's make (bmake); if you prefer GNU make, `pkg install gmake` and
+`gmake -f Makefile-Linux` also works, as that file only needs pkg-config to
+find libuv and OpenSSL.
 
 Unlike Makefile-Linux, Makefile-FreeBSD does not define `_POSIX_C_SOURCE`:
 on FreeBSD that hides the BSD interfaces that the system's own network
@@ -115,11 +121,11 @@ on a FreeBSD machine.
 
 macOS 12 or later, on Apple silicon or Intel. You need the Xcode Command
 Line Tools (for `cc`, which is Apple's clang, and `make`) and
-[Homebrew](https://brew.sh) for libuv and pkg-config:
+[Homebrew](https://brew.sh) for libuv, OpenSSL 3 and pkg-config:
 
 ```sh
 xcode-select --install                       # once, if not done already
-brew install libuv pkg-config
+brew install libuv openssl@3 pkg-config
 make -f Makefile-macOS                       # build/macos/release (and ./oncrpcgen link)
 make -f Makefile-macOS check                 # tests and examples
 make -f Makefile-macOS soak                  # the soak test; SEED=7 SCALE=10 for a longer run
@@ -129,13 +135,16 @@ make -f Makefile-macOS clean                 # removes build/macos only
 ```
 
 Variables: `CC`, `CFLAGS`, `PREFIX`, `DESTDIR`, `V=1` (show the full
-commands), and `ARCHFLAGS`. Like Makefile-FreeBSD, it does not define
+commands), `OPENSSL_PREFIX` and `ARCHFLAGS`. Homebrew installs OpenSSL 3 out
+of the way ("keg-only"), so the makefile asks `brew --prefix openssl@3`
+where it is; set `OPENSSL_PREFIX=...` to use another OpenSSL 3. Like
+Makefile-FreeBSD, it does not define
 `_POSIX_C_SOURCE` (on macOS that hides the BSD interfaces the system headers
 rely on); it defines `_DARWIN_C_SOURCE` instead, as does `src/internal.h`.
 
 **Universal binaries** (for Apple silicon and Intel together) need libuv
-built for both as well, which Homebrew does not do: build it yourself with
-`-arch arm64 -arch x86_64`, point pkg-config at it, and then
+and OpenSSL built for both as well, which Homebrew does not do: build them
+yourself with `-arch arm64 -arch x86_64`, point pkg-config at them, and then
 `make -f Makefile-macOS ARCHFLAGS="-arch arm64 -arch x86_64"`. A plain build
 runs on the kind of Mac it was built on.
 
@@ -145,8 +154,8 @@ example when no port mapper answers.
 ## Windows (Visual Studio 2026)
 
 The solution uses platform toolset **v145** (Visual Studio 2026) and gets
-libuv through **vcpkg manifest mode** (`vcpkg.json`). Visual Studio 2026
-includes vcpkg.
+libuv and OpenSSL through **vcpkg manifest mode** (`vcpkg.json`). Visual
+Studio 2026 includes vcpkg.
 
 ### One-time setup
 
@@ -168,10 +177,10 @@ includes vcpkg.
 1. Open `oncrpc.sln`.
 2. Choose **Release | x64** (or Debug) and **Build > Build Solution**.
 
-The first build downloads and compiles libuv into `vcpkg_installed\`, which
-takes a few minutes; later builds reuse it. Output goes to
-`build\x64\Release\`, with the libuv DLL copied next to the programs; the static
-library is `build\x64\Release\liboncrpc.lib`.
+The first build downloads and compiles libuv and OpenSSL into
+`vcpkg_installed\`, which takes several minutes; later builds reuse them.
+Output goes to `build\x64\Release\`, with the libuv and OpenSSL DLLs copied
+next to the programs; the static library is `build\x64\Release\liboncrpc.lib`.
 
 From the command line (Developer PowerShell):
 
@@ -227,9 +236,10 @@ After building the solution, from the repository root:
 .\tests\run_tests.ps1 -Configuration Debug
 ```
 
-It runs the four tests, then each example's server and client on ports
-39124 to 39130 of 127.0.0.1 (`-BasePort` moves them), skipping
-`06_portmap`, and exits with 0 if everything passed. If PowerShell refuses
+It runs the tests (`test_xdr`, `test_xspec`, `test_gen`, `test_rpc`,
+`test_rpcb`, `test_tls`; `-Soak` adds `test_soak`), then each example's
+server and client on ports 39124 to 39133 of 127.0.0.1 (`-BasePort` moves
+them), skipping `06_portmap`, and exits with 0 if everything passed. If PowerShell refuses
 to run scripts, use `powershell -ExecutionPolicy Bypass -File
 tests\run_tests.ps1`.
 
@@ -239,7 +249,8 @@ tests\run_tests.ps1`.
    in the build) to your solution, and to your project add a reference to
    `liboncrpc` (*References > Add Reference*).
 2. Add liboncrpc's `src` folder to *C/C++ > General > Additional Include
-   Directories*, and add libuv to your `vcpkg.json` (or use this one).
+   Directories*, and add libuv and OpenSSL to your `vcpkg.json` (or use this
+   one).
 3. To generate code from your `.x` file as part of the build, copy the
    `CustomBuild` item from one of the example projects (for example
    `examples\01_add\01_add_server.vcxproj`), and add the generated `.c` files
@@ -249,16 +260,13 @@ tests\run_tests.ps1`.
 
 ### Status
 
-Not yet opened in Visual Studio here: the solution and project files follow
-the same layout as `libtorrentinfo.vcxproj` but have only been checked as
-XML. What has been checked on Windows terms: every source of every project
-(library, oncrpcgen, generated code, examples, tests) compiles with no
-warnings with MinGW-w64 (`-std=c17 -Wall -Wextra -Wpedantic -Wshadow
--Wconversion`, the same defines as the projects) against libuv 1.48 built
-for Windows, and the resulting Windows programs pass `tests\run_tests.ps1`
-(all four tests, including the RPC test's out-of-memory sweeps, and every
-example) when run under Wine. oncrpcgen.exe generates byte-for-byte the
-same code as on Linux, apart from line endings.
+Built with Visual Studio 2026 Community with no warnings, and the tests,
+examples and soak test pass (`tests\run_tests.ps1 -Soak`). The TLS parts
+(`src\tls.c`, `test_tls`, `10_tls`) are newer than that: every source
+compiles with no warnings with MinGW-w64 (`-std=c99 -Wall -Wextra -Wpedantic
+-Wshadow -Wconversion`, the same defines as the projects) against libuv and
+OpenSSL 3 built for Windows, but they have yet to be built and run with
+Visual Studio.
 
 ## Tests
 
@@ -270,9 +278,10 @@ same code as on Linux, apart from line endings.
 | `test_xspec` | the `.x` parser: every construct, error messages and line numbers |
 | `test_gen`   | generated XDR code for every declaration form: encode, decode, re-encode, truncated input; with make, the generated client, server and both skeletons are also built with `-Werror` |
 | `test_rpc`   | a client and a server in one loop: 200 concurrent calls, deferred replies, TCP and UDP, timeouts, retransmission, cancellation, refused connections, unknown hosts, reconnection, a server closing while requests are open, the same calls over a local socket (with the caller's uid and gid, a path already in use, the socket file removed on close), the UDP duplicate-request cache (replays, ignored resends, expiry, eviction, size limits), the server limits (connections, outstanding requests, pausing and resuming connections, idle timeout), and two out-of-memory sweeps that fail each allocation in turn and check that nothing leaks |
+| `test_tls`   | RPC-with-TLS: the AUTH_TLS request and the STARTTLS answer byte by byte; calls over TLS (many at once, a 300 KB string there and back); the server's certificate checked against a trusted authority, its DNS name and its IP address, and checking switched off; mutual TLS with a client certificate required, missing or untrusted, and the subject the server sees; a server without TLS; a server requiring TLS (refusing plain TCP and UDP, allowing local sockets); a TLS connection closed when idle and remade; configuration errors. The certificates are in `tests/tls_certs.h` |
 | `check-alloc`| (make only) `nm` check that the library never references the C allocator |
 | `test_rpcb`  | universal addresses (IPv4, IPv6, malformed input); with rpcbind running, entries set, looked up and removed by network id, a server's listeners registered and found by clients over TCP and UDP, and its local socket registered as `local` and found by its path; with nothing on port 111 and permission to listen there, a stand-in version 2 port mapper that registration and look-ups must fall back to. The parts that cannot run are skipped |
-| examples     | every example's client against its server; `06_portmap` only if a port mapper answers; `09_local` over a socket in `$TMPDIR` (a named pipe on Windows) (`tests/run_examples.sh`) |
+| examples     | every example's client against its server; `06_portmap` only if a port mapper answers; `09_local` over a socket in `$TMPDIR` (a named pipe on Windows); `10_tls` with the certificates in `examples/10_tls/certs` (`tests/run_examples.sh`) |
 
 The soak test runs separately, with `make soak` or
 `tests\run_tests.ps1 -Soak`, as it takes about ten seconds:
@@ -287,8 +296,13 @@ calls. The seed fixes the relay's and the clients' decisions, but which
 datagram meets which decision also depends on timing, so a failing seed
 makes a failure likely to recur rather than certain.
 
-The examples use ports 39124 to 39130 on 127.0.0.1; set
+The examples use ports 39124 to 39133 on 127.0.0.1; set
 `ONCRPC_TEST_PORT` (make) or `-BasePort` (PowerShell) to move them.
+
+The test and example certificates (in `tests/tls_certs.h` and
+`examples/10_tls/certs`) are made by `sh tests/make_test_certs.sh`, which
+needs the `openssl` command. They are valid until 2126, and their private
+keys are public: use them for nothing but the tests and examples.
 
 ## Using the library in your own makefiles
 
@@ -297,10 +311,10 @@ and the library from `build/`):
 
 ```sh
 oncrpcgen myproto.x               # myproto.h, myproto_xdr.c, myproto_clnt.c, myproto_svc.c
-cc -std=c99 -I/usr/local/include/oncrpc $(pkg-config --cflags libuv) -c \
+cc -std=c99 -I/usr/local/include/oncrpc $(pkg-config --cflags libuv openssl) -c \
    myclient.c myproto_xdr.c myproto_clnt.c
 cc -o myclient myclient.o myproto_xdr.o myproto_clnt.o -L/usr/local/lib -loncrpc \
-   $(pkg-config --libs libuv)
+   $(pkg-config --libs libuv openssl)
 ```
 
 On Linux with strict `-std=c99`, your own files that include `oncrpc.h` need

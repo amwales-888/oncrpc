@@ -1,7 +1,7 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <!--
   liboncrpc: ONC RPC (RFC 5531) and XDR (RFC 4506) on libuv, with the .x parser
-  and code generator, as a static library. libuv comes from vcpkg.json.
+  and code generator, as a static library. libuv and OpenSSL come from vcpkg.json.
 -->
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
@@ -45,7 +45,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
 
-  <!-- Install libuv from vcpkg.json (requires "vcpkg integrate install" once; see BUILDING.md). -->
+  <!-- Install libuv and OpenSSL from vcpkg.json (requires "vcpkg integrate install" once; see BUILDING.md). -->
   <PropertyGroup Label="Vcpkg">
     <VcpkgEnableManifest>true</VcpkgEnableManifest>
   </PropertyGroup>
@@ -90,6 +90,7 @@
     <ClCompile Include="src\client.c" />
     <ClCompile Include="src\pmap.c" />
     <ClCompile Include="src\server.c" />
+    <ClCompile Include="src\tls.c" />
     <ClCompile Include="src\xparse.c" />
     <ClCompile Include="src\xgen.c" />
   </ItemGroup>

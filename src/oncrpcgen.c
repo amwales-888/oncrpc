@@ -13,7 +13,7 @@
 #include "xdr.h"
 #include "xspec.h"
 
-#define ONCRPC_GEN_VERSION "3.2.0"
+#define ONCRPC_GEN_VERSION "4.0.0"
 
 static void *app_realloc(void *ctx, void *ptr, size_t size)
 {

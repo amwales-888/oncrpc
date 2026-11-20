@@ -32,6 +32,9 @@
     <ClCompile Include="src\server.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\tls.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\xparse.c">
       <Filter>Source Files</Filter>
     </ClCompile>

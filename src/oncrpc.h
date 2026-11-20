@@ -34,7 +34,7 @@
 extern "C" {
 #endif
 
-#define ONCRPC_VERSION_STRING     "3.2.0"
+#define ONCRPC_VERSION_STRING     "4.0.0"
 #define ONCRPC_PROTOCOL_VERSION   2u          /* RPC message protocol version */
 #define ONCRPC_MAX_AUTH_BYTES     400u        /* opaque_auth body limit */
 #define ONCRPC_MAX_MACHINENAME    255u
@@ -97,7 +97,8 @@ typedef enum oncRPCAuthFlavor {
     ONCRPC_AUTH_SYS   = 1,
     ONCRPC_AUTH_SHORT = 2,
     ONCRPC_AUTH_DH    = 3,
-    ONCRPC_RPCSEC_GSS = 6
+    ONCRPC_RPCSEC_GSS = 6,
+    ONCRPC_AUTH_TLS   = 7    /* RFC 9289: asks a server to start TLS */
 } oncRPCAuthFlavor;
 
 /* accept_stat values of an accepted reply. */
@@ -144,7 +145,8 @@ typedef enum oncRPCStat {
     ONCRPC_ERR_NOMEM,
     ONCRPC_ERR_INVALID,           /* invalid argument or state */
     ONCRPC_ERR_CANCELLED,         /* handle closed before completion */
-    ONCRPC_ERR_FAILED             /* unspecified failure */
+    ONCRPC_ERR_FAILED,            /* unspecified failure */
+    ONCRPC_ERR_TLS                /* TLS refused or failed (see oncRPCError.detail) */
 } oncRPCStat;
 
 /* Details of a call's outcome (see oncRPCClientLastError). */
@@ -153,6 +155,7 @@ typedef struct oncRPCError {
     uint32_t       low, high;   /* supported range for *_VERSMISMATCH */
     oncRPCAuthStat why;         /* reason for ONCRPC_ERR_AUTHERROR */
     int            uvError;     /* libuv error code behind a transport failure, or 0 */
+    const char    *detail;      /* for ONCRPC_ERR_TLS: what went wrong, or NULL */
 } oncRPCError;
 
 /* AUTH_SYS credential body. */
@@ -415,6 +418,8 @@ typedef struct oncRPCServerStats {
     size_t   pendingRequests;        /* being handled now */
     size_t   duplicateCacheEntries;  /* in the cache now */
     size_t   duplicateCacheBytes;
+    uint64_t tlsSessions;            /* connections upgraded to TLS */
+    uint64_t tlsFailures;            /* TLS handshakes that failed */
 } oncRPCServerStats;
 
 /* Read or change the limits; changes apply at once. The duplicate cache is
@@ -456,6 +461,87 @@ ONCRPC_API void oncRPCSvcErrSystem(oncRPCSvcReq *req);     /* SYSTEM_ERR */
 ONCRPC_API void oncRPCSvcErrNoProg(oncRPCSvcReq *req);     /* PROG_UNAVAIL */
 ONCRPC_API void oncRPCSvcErrProgVers(oncRPCSvcReq *req, uint32_t low, uint32_t high);
 ONCRPC_API void oncRPCSvcErrAuth(oncRPCSvcReq *req, oncRPCAuthStat why);
+
+/* ---- TLS (RFC 9289, RPC-with-TLS) ------------------------------------------ */
+
+/*
+ * A TCP connection can be upgraded to TLS 1.3: the client asks with a NULL
+ * call carrying the AUTH_TLS credential, a server that agrees answers
+ * "STARTTLS", and every later message on the connection is encrypted.
+ * Clients still send their usual credentials (AUTH_NONE, AUTH_SYS) inside.
+ * TLS is built on OpenSSL 3. Only TCP connections are upgraded: UDP
+ * (which would need DTLS) and local sockets are not.
+ *
+ * A configuration holds certificates, keys and trust for one side and is
+ * shared by any number of clients or servers. Certificates and keys are
+ * given as PEM text in memory, so that nothing here reads files; read them
+ * however suits the application (the examples use plain stdio at start-up).
+ */
+typedef struct oncRPCTlsConfig oncRPCTlsConfig;
+
+typedef enum oncRPCTlsRole {
+    ONCRPC_TLS_CLIENT,
+    ONCRPC_TLS_SERVER
+} oncRPCTlsRole;
+
+typedef enum oncRPCTlsVerify {
+    /* Client: do not check the server's certificate (for testing only).
+     * Server: do not ask clients for certificates (the server default). */
+    ONCRPC_TLS_VERIFY_NONE,
+    /* Client: the server's certificate must chain to a trusted certificate
+     * and name the server (the client default). Server: ask clients for a
+     * certificate and check any that is given. */
+    ONCRPC_TLS_VERIFY_PEER,
+    /* Server: clients must present a certificate that checks out (mutual
+     * TLS). Same as VERIFY_PEER for a client. */
+    ONCRPC_TLS_VERIFY_REQUIRE
+} oncRPCTlsVerify;
+
+ONCRPC_API oncRPCStat oncRPCTlsConfigCreate(const oncRPCAllocator *alloc, oncRPCTlsRole role,
+                                            oncRPCTlsConfig **out);
+/* Release the application's hold; clients and servers using the
+ * configuration keep it alive until they close. */
+ONCRPC_API void       oncRPCTlsConfigFree(oncRPCTlsConfig *cfg);
+/* This side's certificate (followed by any intermediate certificates) and
+ * private key, as PEM text. Required for a server; for a client, sent when
+ * a server asks. */
+ONCRPC_API oncRPCStat oncRPCTlsConfigSetCertificate(oncRPCTlsConfig *cfg, const char *certPem,
+                                                    const char *keyPem);
+/* Trust the certificate(s) in PEM text as issuers of the peer's
+ * certificate. May be called several times. */
+ONCRPC_API oncRPCStat oncRPCTlsConfigAddTrusted(oncRPCTlsConfig *cfg, const char *pem);
+/* Also trust OpenSSL's default certificate store. OpenSSL may read files
+ * from it while checking a certificate, which blocks briefly. */
+ONCRPC_API oncRPCStat oncRPCTlsConfigUseSystemTrust(oncRPCTlsConfig *cfg);
+ONCRPC_API oncRPCStat oncRPCTlsConfigSetVerify(oncRPCTlsConfig *cfg, oncRPCTlsVerify mode);
+
+/*
+ * Use TLS for this client's TCP connections. Call it before the loop next
+ * runs after oncRPCClientCreate (the connection is upgraded as soon as it
+ * is made, and again whenever it is remade). serverName is the name the
+ * server's certificate must carry - a DNS name, or an IP address - and is
+ * sent to the server (SNI) when it is a name; NULL means the host given to
+ * oncRPCClientCreate. Calls wait until TLS is up; if it cannot be set up,
+ * they fail with ONCRPC_ERR_TLS, with the reason in oncRPCClientLastError's
+ * detail (and so does the ready callback).
+ */
+ONCRPC_API oncRPCStat oncRPCClientSetTls(oncRPCClient *clnt, oncRPCTlsConfig *cfg,
+                                         const char *serverName);
+
+/*
+ * Offer TLS on this server's TCP connections. With required set, requests
+ * that did not arrive over TLS - on TCP connections that were not
+ * upgraded, and over UDP - are refused with AUTH_ERROR / AUTH_TOOWEAK;
+ * local sockets are not affected. cfg must have a certificate.
+ */
+ONCRPC_API oncRPCStat oncRPCServerSetTls(oncRPCServer *srv, oncRPCTlsConfig *cfg, int required);
+
+/* Whether the request arrived over TLS. */
+ONCRPC_API int oncRPCSvcTls(const oncRPCSvcReq *req);
+/* The subject of the certificate the client presented and that checked out
+ * (mutual TLS), as an RFC 2253 string such as "CN=alice,O=Example". Returns
+ * 0, or -1 if there is none. */
+ONCRPC_API int oncRPCSvcTlsPeer(const oncRPCSvcReq *req, char *buf, size_t len);
 
 #ifdef __cplusplus
 }

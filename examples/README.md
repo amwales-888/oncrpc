@@ -14,6 +14,7 @@ one or two new ideas, so read them in order.
 | `07_errors/`   | AUTH_SYS credentials, rejecting callers, timeouts, unknown procedures and versions |
 | `08_xdr/`      | XDR on its own, for files or messages, with no networking      |
 | `09_local/`    | a service on a local socket; knowing which user is calling     |
+| `10_tls/`      | calls over TLS, with certificates on both sides                 |
 
 Building liboncrpc builds them too (see `BUILDING.md`). Where the programs end up:
 

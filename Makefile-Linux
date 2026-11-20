@@ -3,7 +3,8 @@
 #   make -f Makefile-Linux             build the library, oncrpcgen and the examples
 #   make -f Makefile-Linux debug       the same with AddressSanitizer and UBSan, in
 #                                      build/linux/debug
-#   make -f Makefile-Linux lib         build only liboncrpc.a
+#   make -f Makefile-Linux lib         build only the libraries: liboncrpc.a and
+#                                      liboncrpc.so
 #   make -f Makefile-Linux check       build and run the tests and the examples
 #                                      ('make -f Makefile-Linux debug check' runs them
 #                                      under the sanitizers)
@@ -38,6 +39,18 @@ INCLUDEDIR := $(PREFIX)/include/oncrpc
 
 PROGRAM    := oncrpcgen
 LIBRARY    := liboncrpc.a
+
+# The shared library is named after the version in src/oncrpc.h:
+# liboncrpc.so.4.1.0, with the soname liboncrpc.so.4 (the major version,
+# which changes when programs must be rebuilt) and liboncrpc.so for linking.
+VERSION      := $(shell sed -n 's/.*ONCRPC_VERSION_STRING *"\([0-9.]*\)".*/\1/p' src/oncrpc.h)
+MAJOR        := $(firstword $(subst ., ,$(VERSION)))
+SHLIB        := liboncrpc.so.$(VERSION)
+SHLIB_SONAME := liboncrpc.so.$(MAJOR)
+SHLIB_LINK   := liboncrpc.so
+# Fail the link if the library needs anything it does not name (not under
+# the sanitizers, whose run-time is supplied by the program).
+SHLIB_LDFLAGS := -Wl,--no-undefined
 
 SRCDIR      := src
 
@@ -81,6 +94,7 @@ ifneq ($(filter debug,$(MAKECMDGOALS)),)
   BUILD   := $(BUILDROOT)/debug
   CFLAGS  += -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
   LDFLAGS += -fsanitize=address,undefined
+  SHLIB_LDFLAGS :=
 endif
 
 OBJDIR      := $(BUILD)/obj
@@ -96,7 +110,8 @@ EXAMPLE_PROGRAMS := $(foreach e,$(RPC_EXAMPLES),\
                       $(EXDIR)/$(call example_dir,$(e))/client) \
                     $(EXDIR)/08_xdr/xdr_demo
 TEST_PROGRAMS := $(TESTDIR)/test_xdr $(TESTDIR)/test_xspec $(TESTDIR)/test_rpcb $(TESTDIR)/test_gen \
-                 $(TESTDIR)/test_rpc $(TESTDIR)/test_tls $(TESTDIR)/test_soak
+                 $(TESTDIR)/test_rpc $(TESTDIR)/test_rpc_shared $(TESTDIR)/test_tls \
+                 $(TESTDIR)/test_soak
 
 # Quiet output; 'make V=1' shows full commands.
 ifeq ($(V),1)
@@ -111,24 +126,35 @@ endif
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all debug lib examples check check-alloc soak install uninstall clean
+.PHONY: all debug lib examples check check-alloc check-exports soak install uninstall clean
 
-all: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(EXAMPLE_PROGRAMS)
+all: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(BUILD)/$(SHLIB) $(EXAMPLE_PROGRAMS)
 	$(Q)ln -sf $(BUILD)/$(PROGRAM) $(PROGRAM)
 
-debug: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(EXAMPLE_PROGRAMS)
+debug: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(BUILD)/$(SHLIB) $(EXAMPLE_PROGRAMS)
 	@echo "Debug build: $(BUILD)"
 
-lib: $(BUILD)/$(LIBRARY)
+lib: $(BUILD)/$(LIBRARY) $(BUILD)/$(SHLIB)
 
 examples: $(EXAMPLE_PROGRAMS)
 
 # The library and the code generator
 
+# One set of objects serves both libraries: position-independent, and with
+# only the functions marked ONCRPC_API visible outside the shared library.
+$(LIB_OBJECTS): CFLAGS += -fPIC -fvisibility=hidden
+
 $(BUILD)/$(LIBRARY): $(LIB_OBJECTS)
 	$(call say,AR,$@)
 	$(Q)rm -f $@
 	$(Q)$(AR) rcs $@ $^
+
+$(BUILD)/$(SHLIB): $(LIB_OBJECTS)
+	$(call say,LINK,$@)
+	$(Q)$(CC) $(LDFLAGS) -shared -Wl,-soname,$(SHLIB_SONAME) $(SHLIB_LDFLAGS) -o $@ \
+	    $(LIB_OBJECTS) $(LDLIBS)
+	$(Q)ln -sf $(SHLIB) $(BUILD)/$(SHLIB_SONAME)
+	$(Q)ln -sf $(SHLIB_SONAME) $(BUILD)/$(SHLIB_LINK)
 
 # oncrpcgen uses only the XDR, parser and generator parts: no libuv.
 $(BUILD)/$(PROGRAM): $(APP_OBJECTS) $(BUILD)/$(LIBRARY)
@@ -273,6 +299,14 @@ $(TESTDIR)/test_rpc: tests/test_rpc.c $(TESTDIR)/calc/calc_xdr.o $(TESTDIR)/calc
 	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/calc $(CFLAGS) $(LDFLAGS) -o $@ $< \
 	    $(filter %.o,$^) $(BUILD)/$(LIBRARY) $(LDLIBS)
 
+# test_rpc_shared: test_rpc again, linked with the shared library (found
+# next to it through the rpath, without installing it).
+$(TESTDIR)/test_rpc_shared: tests/test_rpc.c $(TESTDIR)/calc/calc_xdr.o $(TESTDIR)/calc/calc_clnt.o \
+                            $(TESTDIR)/calc/calc_svc.o $(BUILD)/$(SHLIB)
+	$(call say,CC,$@)
+	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/calc $(CFLAGS) $(LDFLAGS) -o $@ $< \
+	    $(filter %.o,$^) -L$(BUILD) -loncrpc -Wl,-rpath,'$$ORIGIN/..' $(LDLIBS)
+
 # test_tls: RPC-with-TLS, with the certificates in tests/tls_certs.h.
 $(TESTDIR)/test_tls: tests/test_tls.c tests/tls_certs.h $(TESTDIR)/calc/calc_xdr.o \
                      $(TESTDIR)/calc/calc_clnt.o $(TESTDIR)/calc/calc_svc.o $(BUILD)/$(LIBRARY)
@@ -293,11 +327,17 @@ check-alloc: $(LIB_OBJECTS)
 	    echo "check-alloc: FAILED - the library references the C allocator"; exit 1; \
 	else echo "check-alloc: the library does not reference malloc/calloc/realloc/free"; fi
 
-check: $(TEST_PROGRAMS) $(EXAMPLE_PROGRAMS) check-alloc
+# The shared library must export exactly the functions marked ONCRPC_API.
+check-exports: $(BUILD)/$(SHLIB)
+	$(Q)sh tests/check_exports.sh elf $(BUILD)/$(SHLIB) $(NM)
+
+check: $(TEST_PROGRAMS) $(EXAMPLE_PROGRAMS) check-alloc check-exports
 	$(Q)$(TESTDIR)/test_xdr
 	$(Q)$(TESTDIR)/test_xspec
 	$(Q)$(TESTDIR)/test_gen
 	$(Q)$(TESTDIR)/test_rpc
+	$(Q)echo "test_rpc_shared (test_rpc with $(SHLIB_SONAME)):"
+	$(Q)$(TESTDIR)/test_rpc_shared
 	$(Q)$(TESTDIR)/test_rpcb
 	$(Q)$(TESTDIR)/test_tls
 	$(Q)sh tests/run_examples.sh $(EXDIR)
@@ -316,11 +356,16 @@ install: all
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR)
 	install -m 755 $(BUILD)/$(PROGRAM) $(DESTDIR)$(BINDIR)/$(PROGRAM)
 	install -m 644 $(BUILD)/$(LIBRARY) $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	install -m 755 $(BUILD)/$(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB)
+	ln -sf $(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB_SONAME)
+	ln -sf $(SHLIB_SONAME) $(DESTDIR)$(LIBDIR)/$(SHLIB_LINK)
 	install -m 644 $(addprefix $(SRCDIR)/,$(HEADERS)) $(DESTDIR)$(INCLUDEDIR)/
+	@echo "Installed $(SHLIB) in $(LIBDIR); run ldconfig if that is a system directory."
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(PROGRAM)
 	rm -f $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	rm -f $(DESTDIR)$(LIBDIR)/$(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB_SONAME) $(DESTDIR)$(LIBDIR)/$(SHLIB_LINK)
 	rm -f $(addprefix $(DESTDIR)$(INCLUDEDIR)/,$(HEADERS))
 	-rmdir $(DESTDIR)$(INCLUDEDIR) 2>/dev/null
 

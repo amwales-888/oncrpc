@@ -3,7 +3,8 @@
 #   make -f Makefile-FreeBSD             build the library, oncrpcgen and the examples
 #   make -f Makefile-FreeBSD debug       the same with AddressSanitizer and UBSan, in
 #                                        build/freebsd/debug
-#   make -f Makefile-FreeBSD lib         build only liboncrpc.a
+#   make -f Makefile-FreeBSD lib         build only the libraries: liboncrpc.a and
+#                                        liboncrpc.so
 #   make -f Makefile-FreeBSD check       build and run the tests and the examples
 #                                        ('make -f Makefile-FreeBSD debug check' runs
 #                                        them under the sanitizers)
@@ -40,6 +41,14 @@ INCLUDEDIR=     ${PREFIX}/include/oncrpc
 
 PROGRAM=        oncrpcgen
 LIBRARY=        liboncrpc.a
+
+# The shared library, named FreeBSD's way after the major version in
+# src/oncrpc.h: liboncrpc.so.4 (the major version changes when programs
+# must be rebuilt), and liboncrpc.so for linking.
+VERSION!=       sed -n 's/.*ONCRPC_VERSION_STRING *"\([0-9.]*\)".*/\1/p' src/oncrpc.h
+MAJOR=          ${VERSION:R:R}
+SHLIB=          liboncrpc.so.${MAJOR}
+SHLIB_LINK=     liboncrpc.so
 SRCDIR=         src
 
 LIB_SOURCES=    xdr.c auth.c error.c client.c pmap.c server.c tls.c xparse.c xgen.c
@@ -91,9 +100,14 @@ CFLAGS+=        -g -std=c99 -Wall -Wextra -Wpedantic -Wshadow -Wconversion
 CFLAGS+=        -I${SRCDIR} ${SSL_CFLAGS} ${UV_CFLAGS}
 LDLIBS+=        ${UV_LIBS} ${SSL_LIBS} -lpthread
 
+# Fail the link if the shared library needs anything it does not name (not
+# under the sanitizers, whose run-time is supplied by the program).
+SHLIB_LDFLAGS=  -Wl,--no-undefined
+
 .if make(debug)
 CFLAGS+=        -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
 LDFLAGS+=       -fsanitize=address,undefined
+SHLIB_LDFLAGS=
 .endif
 
 .if defined(V) && ${V} == "1"
@@ -106,7 +120,7 @@ Q=              @
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all debug lib examples check check-alloc soak install uninstall clean
+.PHONY: all debug lib examples check check-alloc check-exports soak install uninstall clean
 .MAIN: all
 
 LIB_OBJECTS=
@@ -114,13 +128,15 @@ APP_OBJECTS=
 DEPEND_HEADERS= ${ALL_HEADERS:S,^,${SRCDIR}/,}
 
 # One rule per source file; every object depends on every header, which is
-# simple and always right (a full build takes seconds).
+# simple and always right (a full build takes seconds). One set of library
+# objects serves both libraries: position-independent, and with only the
+# functions marked ONCRPC_API visible outside the shared library.
 .for source in ${LIB_SOURCES}
 LIB_OBJECTS+=   ${OBJDIR}/${source:R}.o
 ${OBJDIR}/${source:R}.o: ${SRCDIR}/${source} ${DEPEND_HEADERS}
 	@mkdir -p ${OBJDIR}
 	@echo "  CC     ${SRCDIR}/${source}"
-	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -c -o ${.TARGET} ${SRCDIR}/${source}
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -fPIC -fvisibility=hidden -c -o ${.TARGET} ${SRCDIR}/${source}
 .endfor
 .for source in ${APP_SOURCES}
 APP_OBJECTS+=   ${OBJDIR}/${source:R}.o
@@ -134,6 +150,12 @@ ${BUILD}/${LIBRARY}: ${LIB_OBJECTS}
 	@echo "  AR     ${.TARGET}"
 	${Q}rm -f ${.TARGET}
 	${Q}${AR} rcs ${.TARGET} ${LIB_OBJECTS}
+
+${BUILD}/${SHLIB}: ${LIB_OBJECTS}
+	@echo "  LINK   ${.TARGET}"
+	${Q}${CC} ${LDFLAGS} -shared -Wl,-soname,${SHLIB} ${SHLIB_LDFLAGS} -o ${.TARGET} \
+	    ${LIB_OBJECTS} ${LDLIBS}
+	${Q}ln -sf ${SHLIB} ${BUILD}/${SHLIB_LINK}
 
 # oncrpcgen uses only the XDR, parser and generator parts: no libuv.
 ${BUILD}/${PROGRAM}: ${APP_OBJECTS} ${BUILD}/${LIBRARY}
@@ -208,7 +230,8 @@ ${EXDIR}/08_xdr/xdr_demo: ${EXDIR}/08_xdr/main.o ${EXDIR}/08_xdr/readings_xdr.o 
 # ---------------------------------------------------------------------------
 
 TEST_PROGRAMS=  ${TESTDIR}/test_xdr ${TESTDIR}/test_xspec ${TESTDIR}/test_rpcb ${TESTDIR}/test_gen \
-                ${TESTDIR}/test_rpc ${TESTDIR}/test_tls ${TESTDIR}/test_soak
+                ${TESTDIR}/test_rpc ${TESTDIR}/test_rpc_shared ${TESTDIR}/test_tls \
+                ${TESTDIR}/test_soak
 
 .for test in test_xdr test_xspec test_rpcb
 ${TESTDIR}/${test}: tests/${test}.c ${BUILD}/${LIBRARY} ${DEPEND_HEADERS}
@@ -267,17 +290,26 @@ ${TESTDIR}/${test}: tests/${test}.c tests/tls_certs.h ${TESTDIR}/calc/calc_xdr.o
 	    ${BUILD}/${LIBRARY} ${LDLIBS}
 .endfor
 
+# test_rpc again, linked with the shared library (found next to it through
+# the rpath, without installing it).
+${TESTDIR}/test_rpc_shared: tests/test_rpc.c ${TESTDIR}/calc/calc_xdr.o ${TESTDIR}/calc/calc_clnt.o \
+                            ${TESTDIR}/calc/calc_svc.o ${BUILD}/${SHLIB}
+	@echo "  CC     ${.TARGET}"
+	${Q}${CC} ${CPPFLAGS} ${CFLAGS} -I${TESTDIR}/calc ${LDFLAGS} -o ${.TARGET} tests/test_rpc.c \
+	    ${TESTDIR}/calc/calc_xdr.o ${TESTDIR}/calc/calc_clnt.o ${TESTDIR}/calc/calc_svc.o \
+	    -L${BUILD} -loncrpc -Wl,-z,origin -Wl,-rpath,'$$ORIGIN/..' ${LDLIBS}
+
 # ---------------------------------------------------------------------------
 # Top-level targets
 # ---------------------------------------------------------------------------
 
-all: ${BUILD}/${PROGRAM} ${BUILD}/${LIBRARY} ${EXAMPLE_PROGRAMS}
+all: ${BUILD}/${PROGRAM} ${BUILD}/${LIBRARY} ${BUILD}/${SHLIB} ${EXAMPLE_PROGRAMS}
 	${Q}ln -sf ${BUILD}/${PROGRAM} ${PROGRAM}
 
-debug: ${BUILD}/${PROGRAM} ${BUILD}/${LIBRARY} ${EXAMPLE_PROGRAMS}
+debug: ${BUILD}/${PROGRAM} ${BUILD}/${LIBRARY} ${BUILD}/${SHLIB} ${EXAMPLE_PROGRAMS}
 	@echo "Debug build: ${BUILD}"
 
-lib: ${BUILD}/${LIBRARY}
+lib: ${BUILD}/${LIBRARY} ${BUILD}/${SHLIB}
 
 examples: ${EXAMPLE_PROGRAMS}
 
@@ -287,11 +319,17 @@ check-alloc: ${LIB_OBJECTS}
 	    echo "check-alloc: FAILED - the library references the C allocator"; exit 1; \
 	else echo "check-alloc: the library does not reference malloc/calloc/realloc/free"; fi
 
-check: ${TEST_PROGRAMS} ${EXAMPLE_PROGRAMS} check-alloc
+# The shared library must export exactly the functions marked ONCRPC_API.
+check-exports: ${BUILD}/${SHLIB}
+	${Q}sh tests/check_exports.sh elf ${BUILD}/${SHLIB} ${NM}
+
+check: ${TEST_PROGRAMS} ${EXAMPLE_PROGRAMS} check-alloc check-exports
 	${Q}${TESTDIR}/test_xdr
 	${Q}${TESTDIR}/test_xspec
 	${Q}${TESTDIR}/test_gen
 	${Q}${TESTDIR}/test_rpc
+	${Q}echo "test_rpc_shared (test_rpc with ${SHLIB}):"
+	${Q}${TESTDIR}/test_rpc_shared
 	${Q}${TESTDIR}/test_rpcb
 	${Q}${TESTDIR}/test_tls
 	${Q}sh tests/run_examples.sh ${EXDIR}
@@ -306,11 +344,14 @@ install: all
 	install -d ${DESTDIR}${BINDIR} ${DESTDIR}${LIBDIR} ${DESTDIR}${INCLUDEDIR}
 	install -m 755 ${BUILD}/${PROGRAM} ${DESTDIR}${BINDIR}/${PROGRAM}
 	install -m 644 ${BUILD}/${LIBRARY} ${DESTDIR}${LIBDIR}/${LIBRARY}
+	install -m 755 ${BUILD}/${SHLIB} ${DESTDIR}${LIBDIR}/${SHLIB}
+	ln -sf ${SHLIB} ${DESTDIR}${LIBDIR}/${SHLIB_LINK}
 	install -m 644 ${HEADERS:S,^,${SRCDIR}/,} ${DESTDIR}${INCLUDEDIR}/
 
 uninstall:
 	rm -f ${DESTDIR}${BINDIR}/${PROGRAM}
 	rm -f ${DESTDIR}${LIBDIR}/${LIBRARY}
+	rm -f ${DESTDIR}${LIBDIR}/${SHLIB} ${DESTDIR}${LIBDIR}/${SHLIB_LINK}
 	rm -f ${HEADERS:S,^,${DESTDIR}${INCLUDEDIR}/,}
 	-rmdir ${DESTDIR}${INCLUDEDIR} 2>/dev/null
 

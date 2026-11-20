@@ -34,7 +34,7 @@
 extern "C" {
 #endif
 
-#define ONCRPC_VERSION_STRING     "4.0.0"
+#define ONCRPC_VERSION_STRING     "4.1.0"
 #define ONCRPC_PROTOCOL_VERSION   2u          /* RPC message protocol version */
 #define ONCRPC_MAX_AUTH_BYTES     400u        /* opaque_auth body limit */
 #define ONCRPC_MAX_MACHINENAME    255u

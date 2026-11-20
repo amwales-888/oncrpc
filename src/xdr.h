@@ -21,12 +21,27 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(_WIN32) && defined(ONCRPC_SHARED)
-#  if defined(ONCRPC_BUILDING)
+/*
+ * ONCRPC_API marks the library's public functions.
+ *
+ * Windows: a program that uses the DLL (oncrpc.dll) defines ONCRPC_SHARED;
+ * the DLL itself is built with ONCRPC_SHARED and ONCRPC_BUILDING. Neither
+ * is defined for the static library (liboncrpc.lib).
+ *
+ * Elsewhere the library is compiled with -fvisibility=hidden, so that only
+ * the functions marked here are exported from liboncrpc.so (or .dylib);
+ * this makes no difference to the static library.
+ */
+#if defined(_WIN32)
+#  if defined(ONCRPC_SHARED) && defined(ONCRPC_BUILDING)
 #    define ONCRPC_API __declspec(dllexport)
-#  else
+#  elif defined(ONCRPC_SHARED)
 #    define ONCRPC_API __declspec(dllimport)
+#  else
+#    define ONCRPC_API
 #  endif
+#elif defined(__GNUC__) && __GNUC__ >= 4
+#  define ONCRPC_API __attribute__((visibility("default")))
 #else
 #  define ONCRPC_API
 #endif

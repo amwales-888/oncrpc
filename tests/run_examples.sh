@@ -5,7 +5,10 @@
 # socket in $TMPDIR (default /tmp).
 # Usage: run_examples.sh BUILD_EXAMPLES_DIR (the makefiles' "check" passes it)
 DIR=${1:-build/linux/release/examples}
-BASE=${ONCRPC_TEST_PORT:-39123}
+# Below every system's range of automatically assigned ports (Linux from
+# 32768, the BSDs, macOS and Windows from 49152), so that no connection
+# made by an earlier test can be holding one of them.
+BASE=${ONCRPC_TEST_PORT:-23400}
 FAILED=0
 SERVER=
 

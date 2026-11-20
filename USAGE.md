@@ -26,6 +26,12 @@ Design rules:
   (`oncRPCClientCreate`, `oncRPCXdrInt32`); constants and macros are
   `ONCRPC_` + upper case.
 
+The library comes as a static library and a shared one (`liboncrpc.so`,
+`liboncrpc.dylib`, or `oncrpc.dll` on Windows); both have the same API. A
+Windows program that uses the DLL defines `ONCRPC_SHARED` before including
+the headers (in its project settings), so that the functions are declared
+as imported; see BUILDING.md.
+
 | Header    | Contents                                                     |
 |-----------|--------------------------------------------------------------|
 | `oncrpc.h`| RPC client, server, rpcbind/port mapper; includes `xdr.h` and `<uv.h>` |

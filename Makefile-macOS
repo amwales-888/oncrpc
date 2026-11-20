@@ -3,7 +3,8 @@
 #   make -f Makefile-macOS             build the library, oncrpcgen and the examples
 #   make -f Makefile-macOS debug       the same with AddressSanitizer and UBSan, in
 #                                      build/macos/debug
-#   make -f Makefile-macOS lib         build only liboncrpc.a
+#   make -f Makefile-macOS lib         build only the libraries: liboncrpc.a and
+#                                      liboncrpc.dylib
 #   make -f Makefile-macOS check       build and run the tests and the examples
 #                                      ('make -f Makefile-macOS debug check' runs them
 #                                      under the sanitizers)
@@ -42,6 +43,21 @@ INCLUDEDIR := $(PREFIX)/include/oncrpc
 
 PROGRAM    := oncrpcgen
 LIBRARY    := liboncrpc.a
+
+# The shared library, named the macOS way after the major version in
+# src/oncrpc.h: liboncrpc.4.dylib (the major version changes when programs
+# must be rebuilt), and liboncrpc.dylib for linking. In the build tree its
+# install name is @rpath/liboncrpc.4.dylib; 'install' sets it to the
+# installed path.
+VERSION       := $(shell sed -n 's/.*ONCRPC_VERSION_STRING *"\([0-9.]*\)".*/\1/p' src/oncrpc.h)
+MAJOR         := $(firstword $(subst ., ,$(VERSION)))
+SHLIB         := liboncrpc.$(MAJOR).dylib
+SHLIB_LINK    := liboncrpc.dylib
+SHLIB_LDFLAGS  = -dynamiclib -install_name @rpath/$(SHLIB) \
+                 -compatibility_version $(MAJOR).0.0 -current_version $(VERSION)
+SHARED_RPATH   = -Wl,-rpath,@loader_path/..
+EXPORTS_KIND   = macho
+INSTALL_NAME_TOOL ?= install_name_tool
 
 SRCDIR      := src
 
@@ -107,7 +123,8 @@ EXAMPLE_PROGRAMS := $(foreach e,$(RPC_EXAMPLES),\
                       $(EXDIR)/$(call example_dir,$(e))/client) \
                     $(EXDIR)/08_xdr/xdr_demo
 TEST_PROGRAMS := $(TESTDIR)/test_xdr $(TESTDIR)/test_xspec $(TESTDIR)/test_rpcb $(TESTDIR)/test_gen \
-                 $(TESTDIR)/test_rpc $(TESTDIR)/test_tls $(TESTDIR)/test_soak
+                 $(TESTDIR)/test_rpc $(TESTDIR)/test_rpc_shared $(TESTDIR)/test_tls \
+                 $(TESTDIR)/test_soak
 
 # Quiet output; 'make V=1' shows full commands.
 ifeq ($(V),1)
@@ -122,24 +139,34 @@ endif
 # Targets
 # ---------------------------------------------------------------------------
 
-.PHONY: all debug lib examples check check-alloc soak install uninstall clean
+.PHONY: all debug lib examples check check-alloc check-exports soak install uninstall clean
 
-all: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(EXAMPLE_PROGRAMS)
+all: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(BUILD)/$(SHLIB) $(EXAMPLE_PROGRAMS)
 	$(Q)ln -sf $(BUILD)/$(PROGRAM) $(PROGRAM)
 
-debug: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(EXAMPLE_PROGRAMS)
+debug: $(BUILD)/$(PROGRAM) $(BUILD)/$(LIBRARY) $(BUILD)/$(SHLIB) $(EXAMPLE_PROGRAMS)
 	@echo "Debug build: $(BUILD)"
 
-lib: $(BUILD)/$(LIBRARY)
+lib: $(BUILD)/$(LIBRARY) $(BUILD)/$(SHLIB)
 
 examples: $(EXAMPLE_PROGRAMS)
 
 # The library and the code generator
 
+# One set of objects serves both libraries: position-independent, and with
+# only the functions marked ONCRPC_API visible outside the shared library.
+$(LIB_OBJECTS): CFLAGS += -fPIC -fvisibility=hidden
+
 $(BUILD)/$(LIBRARY): $(LIB_OBJECTS)
 	$(call say,AR,$@)
 	$(Q)rm -f $@
 	$(Q)$(AR) rcs $@ $^
+
+# Apple's linker refuses a dylib with unresolved symbols by default.
+$(BUILD)/$(SHLIB): $(LIB_OBJECTS)
+	$(call say,LINK,$@)
+	$(Q)$(CC) $(LDFLAGS) $(SHLIB_LDFLAGS) -o $@ $(LIB_OBJECTS) $(LDLIBS)
+	$(Q)ln -sf $(SHLIB) $(BUILD)/$(SHLIB_LINK)
 
 # oncrpcgen uses only the XDR, parser and generator parts: no libuv.
 $(BUILD)/$(PROGRAM): $(APP_OBJECTS) $(BUILD)/$(LIBRARY)
@@ -284,6 +311,14 @@ $(TESTDIR)/test_rpc: tests/test_rpc.c $(TESTDIR)/calc/calc_xdr.o $(TESTDIR)/calc
 	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/calc $(CFLAGS) $(LDFLAGS) -o $@ $< \
 	    $(filter %.o,$^) $(BUILD)/$(LIBRARY) $(LDLIBS)
 
+# test_rpc_shared: test_rpc again, linked with the shared library (found
+# next to it through the rpath, without installing it).
+$(TESTDIR)/test_rpc_shared: tests/test_rpc.c $(TESTDIR)/calc/calc_xdr.o $(TESTDIR)/calc/calc_clnt.o \
+                            $(TESTDIR)/calc/calc_svc.o $(BUILD)/$(SHLIB)
+	$(call say,CC,$@)
+	$(Q)$(CC) $(CPPFLAGS) -I$(TESTDIR)/calc $(CFLAGS) $(LDFLAGS) -o $@ $< \
+	    $(filter %.o,$^) -L$(BUILD) -loncrpc $(SHARED_RPATH) $(LDLIBS)
+
 # test_tls: RPC-with-TLS, with the certificates in tests/tls_certs.h.
 $(TESTDIR)/test_tls: tests/test_tls.c tests/tls_certs.h $(TESTDIR)/calc/calc_xdr.o \
                      $(TESTDIR)/calc/calc_clnt.o $(TESTDIR)/calc/calc_svc.o $(BUILD)/$(LIBRARY)
@@ -304,11 +339,17 @@ check-alloc: $(LIB_OBJECTS)
 	    echo "check-alloc: FAILED - the library references the C allocator"; exit 1; \
 	else echo "check-alloc: the library does not reference malloc/calloc/realloc/free"; fi
 
-check: $(TEST_PROGRAMS) $(EXAMPLE_PROGRAMS) check-alloc
+# The shared library must export exactly the functions marked ONCRPC_API.
+check-exports: $(BUILD)/$(SHLIB)
+	$(Q)sh tests/check_exports.sh $(EXPORTS_KIND) $(BUILD)/$(SHLIB) $(NM)
+
+check: $(TEST_PROGRAMS) $(EXAMPLE_PROGRAMS) check-alloc check-exports
 	$(Q)$(TESTDIR)/test_xdr
 	$(Q)$(TESTDIR)/test_xspec
 	$(Q)$(TESTDIR)/test_gen
 	$(Q)$(TESTDIR)/test_rpc
+	$(Q)echo "test_rpc_shared (test_rpc with $(SHLIB)):"
+	$(Q)$(TESTDIR)/test_rpc_shared
 	$(Q)$(TESTDIR)/test_rpcb
 	$(Q)$(TESTDIR)/test_tls
 	$(Q)sh tests/run_examples.sh $(EXDIR)
@@ -327,11 +368,15 @@ install: all
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(INCLUDEDIR)
 	install -m 755 $(BUILD)/$(PROGRAM) $(DESTDIR)$(BINDIR)/$(PROGRAM)
 	install -m 644 $(BUILD)/$(LIBRARY) $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	install -m 755 $(BUILD)/$(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB)
+	$(INSTALL_NAME_TOOL) -id $(LIBDIR)/$(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB)
+	ln -sf $(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB_LINK)
 	install -m 644 $(addprefix $(SRCDIR)/,$(HEADERS)) $(DESTDIR)$(INCLUDEDIR)/
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(PROGRAM)
 	rm -f $(DESTDIR)$(LIBDIR)/$(LIBRARY)
+	rm -f $(DESTDIR)$(LIBDIR)/$(SHLIB) $(DESTDIR)$(LIBDIR)/$(SHLIB_LINK)
 	rm -f $(addprefix $(DESTDIR)$(INCLUDEDIR)/,$(HEADERS))
 	-rmdir $(DESTDIR)$(INCLUDEDIR) 2>/dev/null
 

@@ -3,7 +3,8 @@
     Runs liboncrpc's tests and examples from a Visual Studio build.
 
 .DESCRIPTION
-    Runs test_xdr, test_xspec, test_gen, test_rpc, test_rpcb and test_tls, then each example: the
+    Runs test_xdr, test_xspec, test_gen, test_rpc, test_rpc_shared (test_rpc with
+    oncrpc.dll), test_rpcb and test_tls, then each example: the
     example's server is started on a test port, its client is run against it,
     and the server is stopped. 06_portmap is skipped, as Windows has no port
     mapper (rpcbind); 09_local uses a named pipe. With -Soak, test_soak runs as well: many clients
@@ -20,7 +21,7 @@
 
 .PARAMETER BasePort
     The examples use ports BasePort+1 to BasePort+8 on 127.0.0.1
-    (default 39123).
+    (default 23400; below the ports Windows assigns automatically).
 
 .PARAMETER Suffix
     File name suffix of the programs (default .exe).
@@ -45,7 +46,7 @@ param(
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
     [string]$BinDir = '',
-    [int]$BasePort = 39123,
+    [int]$BasePort = 23400,
     [string]$Suffix = '.exe',
     [switch]$Soak,
     [int]$Seed = 1,
@@ -70,7 +71,8 @@ function Program([string]$name) {
 
 # ---- Tests --------------------------------------------------------------------
 
-foreach ($test in 'test_xdr', 'test_xspec', 'test_gen', 'test_rpc', 'test_rpcb', 'test_tls') {
+foreach ($test in 'test_xdr', 'test_xspec', 'test_gen', 'test_rpc', 'test_rpc_shared', 'test_rpcb',
+                  'test_tls') {
     Write-Host "== $test"
     & (Program $test)
     if ($LASTEXITCODE -ne 0) {

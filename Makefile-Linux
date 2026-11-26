@@ -41,7 +41,7 @@ PROGRAM    := oncrpcgen
 LIBRARY    := liboncrpc.a
 
 # The shared library is named after the version in src/oncrpc.h:
-# liboncrpc.so.4.1.0, with the soname liboncrpc.so.4 (the major version,
+# liboncrpc.so.4.3.0, with the soname liboncrpc.so.4 (the major version,
 # which changes when programs must be rebuilt) and liboncrpc.so for linking.
 VERSION      := $(shell sed -n 's/.*ONCRPC_VERSION_STRING *"\([0-9.]*\)".*/\1/p' src/oncrpc.h)
 MAJOR        := $(firstword $(subst ., ,$(VERSION)))
@@ -63,7 +63,7 @@ ALL_HEADERS := $(HEADERS) internal.h
 # only, no networking) is built separately below.
 RPC_EXAMPLES := 01_add:add 02_strings:greet 03_shapes:shapes 04_lists:lists \
                 05_async:delay 06_portmap:clock 07_errors:secure \
-                09_local:local 10_tls:hello
+                09_local:local 10_tls:hello 11_auth:token
 
 PKGS := libuv openssl
 

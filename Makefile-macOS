@@ -70,7 +70,7 @@ ALL_HEADERS := $(HEADERS) internal.h
 # only, no networking) is built separately below.
 RPC_EXAMPLES := 01_add:add 02_strings:greet 03_shapes:shapes 04_lists:lists \
                 05_async:delay 06_portmap:clock 07_errors:secure \
-                09_local:local 10_tls:hello
+                09_local:local 10_tls:hello 11_auth:token
 
 PKGS := libuv openssl
 

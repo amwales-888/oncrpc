@@ -15,6 +15,7 @@ one or two new ideas, so read them in order.
 | `08_xdr/`      | XDR on its own, for files or messages, with no networking      |
 | `09_local/`    | a service on a local socket; knowing which user is calling     |
 | `10_tls/`      | calls over TLS, with certificates on both sides                 |
+| `11_auth/`     | a home-made authentication flavor; noticing when a caller stops waiting |
 
 Building liboncrpc builds them too (see `BUILDING.md`). Where the programs end up:
 

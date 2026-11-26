@@ -33,8 +33,14 @@ typedef struct ccall {
     struct ccall  *next;
     struct ccall  *prev;
     uint32_t       xid;
+    oncRPCCallId   id;         /* for oncRPCClientCancel */
     uint8_t       *msg;        /* encoded call, 4 bytes reserved for record mark */
     size_t         msglen;
+    size_t         argOff;     /* where the arguments start in msg */
+    uint32_t       proc;
+    uint32_t       authGen;    /* the authentication it was encoded with */
+    int            keepMsg;    /* keep msg after sending: may be refreshed */
+    int            refreshes;
     oncRPCXdrProc  xres;
     void          *res;
     oncRPCCallCb   cb;
@@ -87,11 +93,15 @@ struct oncRPCClient {
     ccall                 *calls;      /* all outstanding calls, oldest first */
     ccall                 *callsTail;
     size_t                 ncalls;
+    oncRPCCallId           lastId;     /* id of the most recently started call */
     uint32_t               xid;
     uint32_t               timeoutMs;
     uint32_t               retryMs;
     size_t                 maxRecord;
     oncRPCOpaqueAuth       cred;
+    const oncRPCClientAuth *auth;      /* set: custom authentication */
+    void                  *authData;
+    uint32_t               authGen;    /* changes whenever auth is set */
     oncRPCError            err;
 
     uint8_t               *rbuf;       /* receive buffer */
@@ -126,6 +136,7 @@ static void send_call(oncRPCClient *c, ccall *k);
 static void tls_failed(oncRPCClient *c, const char *why);
 static int  tls_flush(oncRPCClient *c);
 static void became_ready(oncRPCClient *c);
+static void release_auth(oncRPCClient *c);
 
 /* The connection is gone: so is its TLS session. */
 static void drop_tls(oncRPCClient *c)
@@ -242,6 +253,7 @@ static void close_step_done(oncRPCClient *c)
             c->err.detail = c->tlsErr;
         complete(c, k, k->fail != ONCRPC_OK ? k->fail : ONCRPC_ERR_CANCELLED);
     }
+    release_auth(c);
     cb = c->closeCb;
     data = c->closeData;
     oncRPCIntTlsFree(c->tls);
@@ -432,8 +444,10 @@ static void send_call(oncRPCClient *c, ccall *k)
             reset_connection(c, ONCRPC_ERR_CANTSEND, 0);
             return;
         }
-        oncRPCFree(c->alloc, k->msg);
-        k->msg = NULL;
+        if (!k->keepMsg) {
+            oncRPCFree(c->alloc, k->msg);
+            k->msg = NULL;
+        }
         return;
     }
     w = (cwreq *)oncRPCAlloc(c->alloc, sizeof(*w));
@@ -466,7 +480,7 @@ static void send_call(oncRPCClient *c, ccall *k)
         return;
     }
     k->sent = 1;
-    if (c->proto != ONCRPC_PROTO_UDP) {
+    if (c->proto != ONCRPC_PROTO_UDP && !k->keepMsg) {
         /* Streams never retransmit: the encoded message is no longer needed. */
         oncRPCFree(c->alloc, k->msg);
         k->msg = NULL;
@@ -502,6 +516,94 @@ static void flush_queue(oncRPCClient *c)
     }
 }
 
+/* ---- Authentication and encoding -------------------------------------------------- */
+
+static void release_auth(oncRPCClient *c)
+{
+    const oncRPCClientAuth *a = c->auth;
+    void *d = c->authData;
+    c->auth = NULL;
+    c->authData = NULL;
+    c->authGen++;
+    if (a != NULL && a->release != NULL)
+        a->release(d);
+}
+
+/* Encode the call header for xid/proc after the record mark: with the
+ * client's AUTH_NONE/AUTH_SYS credential, or from its custom authentication. */
+static int encode_header(oncRPCClient *c, oncRPCXdr *x, uint32_t xid, uint32_t proc)
+{
+    uint32_t mtype = ONCRPC_MSG_CALL, rpcvers = ONCRPC_PROTOCOL_VERSION;
+    oncRPCAuthData a;
+    size_t start;
+
+    if (c->auth == NULL)
+        return oncRPCIntEncodeCall(x, xid, c->prog, c->vers, proc, &c->cred);
+    start = oncRPCXdrGetPos(x);
+    memset(&a, 0, sizeof(a));
+    if (c->auth->credential(c->authData, xid, proc, &a) != 0 ||
+        a.len > ONCRPC_MAX_AUTH_BYTES)
+        return 0;
+    if (!oncRPCXdrUint32(x, &xid) || !oncRPCXdrUint32(x, &mtype) ||
+        !oncRPCXdrUint32(x, &rpcvers) || !oncRPCXdrUint32(x, &c->prog) ||
+        !oncRPCXdrUint32(x, &c->vers) || !oncRPCXdrUint32(x, &proc) ||
+        !oncRPCXdrUint32(x, &a.flavor) || !oncRPCXdrUint32(x, &a.len) ||
+        !oncRPCXdrOpaque(x, a.body, a.len))
+        return 0;
+    memset(&a, 0, sizeof(a));
+    if (c->auth->verifier != NULL &&
+        (c->auth->verifier(c->authData, x->buf + start, oncRPCXdrGetPos(x) - start, &a) != 0 ||
+         a.len > ONCRPC_MAX_AUTH_BYTES))
+        return 0;
+    return oncRPCXdrUint32(x, &a.flavor) && oncRPCXdrUint32(x, &a.len) &&
+           oncRPCXdrOpaque(x, a.body, a.len);
+}
+
+/*
+ * The server refused a call's credentials and the authentication asked to
+ * try again: encode it afresh with a new xid, keeping its arguments, and
+ * queue it again. Returns 0 if that is not possible.
+ */
+static int resend_refreshed(oncRPCClient *c, ccall *k)
+{
+    oncRPCXdr x;
+    uint32_t mark = 0, xid;
+    uint8_t *msg;
+    size_t len, argOff;
+
+    if (k->msg == NULL || c->state == CS_CLOSING || c->state == CS_FAILED)
+        return 0;
+    if (!oncRPCXdrInitEncodeDynamic(&x, c->alloc, k->msglen + 64))
+        return 0;
+    xid = c->xid++;
+    if (!oncRPCXdrUint32(&x, &mark) || !encode_header(c, &x, xid, k->proc) ||
+        (argOff = oncRPCXdrGetPos(&x),
+         !oncRPCXdrOpaque(&x, k->msg + k->argOff, (uint32_t)(k->msglen - k->argOff)))) {
+        oncRPCXdrDestroy(&x);
+        return 0;
+    }
+    msg = oncRPCXdrDetach(&x, &len);
+    if (msg == NULL || (c->proto == ONCRPC_PROTO_UDP && len - 4 > ONCRPC_UDP_MAX)) {
+        oncRPCFree(c->alloc, msg);
+        return 0;
+    }
+    oncRPCIntPutBe32(msg, (uint32_t)(len - 4) | ONCRPC_LAST_FRAGMENT);
+    oncRPCFree(c->alloc, k->msg);
+    k->msg = msg;
+    k->msglen = len;
+    k->argOff = argOff;
+    k->xid = xid;
+    k->sent = 0;
+    k->nextRetx = 0;
+    k->refreshes++;
+    link_call(c, k);
+    if (c->state == CS_READY)
+        send_call(c, k);
+    else if (c->state == CS_IDLE)
+        start_connect(c);
+    return 1;
+}
+
 /* ---- Receiving ----------------------------------------------------------------- */
 
 /* Decode the reply header and results; returns the call status. */
@@ -515,6 +617,17 @@ static oncRPCStat parse_reply(oncRPCClient *c, oncRPCXdr *x, ccall *k)
     if (rstat == ONCRPC_MSG_ACCEPTED) {
         if (!oncRPCIntXdrOpaqueAuth(x, &verf) || !oncRPCXdrUint32(x, &stat))
             return ONCRPC_ERR_CANTDECODE;
+        if (c->auth != NULL && c->auth->validate != NULL && k->authGen == c->authGen) {
+            /* The layouts of the two types are the same. */
+            oncRPCAuthData v;
+            v.flavor = verf.flavor;
+            v.len = verf.len;
+            memcpy(v.body, verf.body, verf.len);
+            if (c->auth->validate(c->authData, k->xid, &v) != 0) {
+                c->err.why = ONCRPC_AUTH_INVALIDRESP;
+                return ONCRPC_ERR_AUTHERROR;
+            }
+        }
         switch (stat) {
         case ONCRPC_ACCEPT_SUCCESS:
             if (k->xres != NULL && !k->xres(x, k->res)) {
@@ -575,6 +688,14 @@ static void handle_reply(oncRPCClient *c, const uint8_t *buf, size_t len)
     unlink_call(c, k);
     memset(&c->err, 0, sizeof(c->err));
     st = parse_reply(c, &x, k);
+    if (st == ONCRPC_ERR_AUTHERROR && c->err.why != ONCRPC_AUTH_INVALIDRESP &&
+        c->auth != NULL && c->auth->refresh != NULL && k->authGen == c->authGen &&
+        k->refreshes < 2 && c->auth->refresh(c->authData, c->err.why) &&
+        resend_refreshed(c, k)) {
+        update_ref(c);
+        schedule(c);
+        return;
+    }
     complete(c, k, st);
     if (c->state != CS_CLOSING) {
         update_ref(c);
@@ -1162,10 +1283,14 @@ oncRPCStat oncRPCClientCall(oncRPCClient *c, uint32_t proc, oncRPCXdrProc xargs,
         oncRPCFree(c->alloc, k);
         return ONCRPC_ERR_NOMEM;
     }
+    memset(k, 0, sizeof(*k));
     k->xid = c->xid++;
+    k->proc = proc;
+    k->authGen = c->authGen;
+    k->keepMsg = c->auth != NULL && c->auth->refresh != NULL;
     (void)oncRPCXdrUint32(&x, &mark);   /* record mark, used only by TCP */
-    if (!oncRPCIntEncodeCall(&x, k->xid, c->prog, c->vers, proc, &c->cred) ||
-        (xargs != NULL && !xargs(&x, (void *)args))) {
+    if (!encode_header(c, &x, k->xid, proc) ||
+        (k->argOff = oncRPCXdrGetPos(&x), xargs != NULL && !xargs(&x, (void *)args))) {
         int nomem = x.error && oncRPCXdrLength(&x) == 0;
         oncRPCXdrDestroy(&x);
         oncRPCFree(c->alloc, k);
@@ -1182,6 +1307,7 @@ oncRPCStat oncRPCClientCall(oncRPCClient *c, uint32_t proc, oncRPCXdrProc xargs,
     k->cb = cb;
     k->data = data;
     k->deadline = uv_now(c->loop) + c->timeoutMs;
+    k->id = ++c->lastId;
     link_call(c, k);
 
     if (c->state == CS_READY)
@@ -1235,6 +1361,31 @@ oncRPCStat oncRPCClientSetTls(oncRPCClient *c, oncRPCTlsConfig *cfg, const char 
     return ONCRPC_OK;
 }
 
+oncRPCCallId oncRPCClientLastCall(const oncRPCClient *c)
+{
+    return c ? c->lastId : 0;
+}
+
+oncRPCStat oncRPCClientCancel(oncRPCClient *c, oncRPCCallId id)
+{
+    ccall *k;
+
+    if (c == NULL || id == 0)
+        return ONCRPC_ERR_INVALID;
+    for (k = c->calls; k != NULL; k = k->next) {
+        if (k->id != id)
+            continue;
+        if (k->fail != ONCRPC_OK)
+            return ONCRPC_ERR_INVALID;   /* already on its way out */
+        k->fail = ONCRPC_ERR_CANCELLED;
+        k->failUv = 0;
+        if (c->state != CS_CLOSING)
+            schedule(c);   /* closing completes it anyway */
+        return ONCRPC_OK;
+    }
+    return ONCRPC_ERR_INVALID;
+}
+
 const oncRPCError *oncRPCClientLastError(const oncRPCClient *c)
 {
     return c ? &c->err : NULL;
@@ -1261,6 +1412,17 @@ oncRPCStat oncRPCClientSetAuthNone(oncRPCClient *c)
         return ONCRPC_ERR_INVALID;
     memset(&c->cred, 0, sizeof(c->cred));
     c->cred.flavor = ONCRPC_AUTH_NONE;
+    release_auth(c);
+    return ONCRPC_OK;
+}
+
+oncRPCStat oncRPCClientSetAuth(oncRPCClient *c, const oncRPCClientAuth *auth, void *data)
+{
+    if (c == NULL || auth == NULL || auth->credential == NULL || c->state == CS_CLOSING)
+        return ONCRPC_ERR_INVALID;
+    release_auth(c);
+    c->auth = auth;
+    c->authData = data;
     return ONCRPC_OK;
 }
 
@@ -1291,6 +1453,7 @@ oncRPCStat oncRPCClientSetAuthSys(oncRPCClient *c, const char *machinename, uint
         return ONCRPC_ERR_CANTENCODE;
     c->cred.flavor = ONCRPC_AUTH_SYS;
     c->cred.len = (uint32_t)oncRPCXdrLength(&x);
+    release_auth(c);
     return ONCRPC_OK;
 }
 

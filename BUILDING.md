@@ -27,7 +27,7 @@ neither.
 | Output (Linux shown; FreeBSD and macOS alike) | What it is |
 |---|---|
 | `build/linux/release/liboncrpc.a` | the static library |
-| `build/linux/release/liboncrpc.so.4.1.0`, with the links `liboncrpc.so.4` and `liboncrpc.so` | the shared library (FreeBSD: `liboncrpc.so.4` and `liboncrpc.so`; macOS: `liboncrpc.4.dylib` and `liboncrpc.dylib`) |
+| `build/linux/release/liboncrpc.so.4.3.0`, with the links `liboncrpc.so.4` and `liboncrpc.so` | the shared library (FreeBSD: `liboncrpc.so.4` and `liboncrpc.so`; macOS: `liboncrpc.4.dylib` and `liboncrpc.dylib`) |
 | `build/linux/release/oncrpcgen` (and a `./oncrpcgen` link) | the `.x` compiler |
 | `build/linux/release/examples/<example>/server`, `client` | the examples (`examples/README.md`); `08_xdr` builds `xdr_demo` |
 | `build/linux/release/examples/<example>/*.h`, `*.c` | the code oncrpcgen generated for each example |
@@ -214,7 +214,7 @@ The solution has these projects:
 | `liboncrpc` | `liboncrpc.lib` (static) | `src\*.c` |
 | `liboncrpc_shared` | `oncrpc.dll` and its import library `oncrpc.lib` | `src\*.c`, with `ONCRPC_SHARED` and `ONCRPC_BUILDING` defined |
 | `oncrpcgen` | `oncrpcgen.exe` | `src\oncrpcgen.c` + liboncrpc |
-| `examples\01_add_server`, `01_add_client`, ... `07_errors_client`, `09_local_server`, `09_local_client` | `<project>.exe` | `examples\<example>\server.c` or `client.c` + generated code |
+| `examples\01_add_server`, `01_add_client`, ... `07_errors_client`, `09_local_server`, ... `11_auth_client` | `<project>.exe` | `examples\<example>\server.c` or `client.c` + generated code |
 | `examples\08_xdr_demo` | `08_xdr_demo.exe` | `examples\08_xdr\main.c` + generated code |
 | `tests\test_xdr`, `test_xspec`, `test_gen`, `test_rpc`, `test_rpcb`, `test_tls`, `test_soak` | `<project>.exe` | `tests\*.c` |
 | `tests\test_rpc_shared` | `test_rpc_shared.exe` | `tests\test_rpc.c`, linked with `oncrpc.dll` |
@@ -259,7 +259,7 @@ After building the solution, from the repository root:
 
 It runs the tests (`test_xdr`, `test_xspec`, `test_gen`, `test_rpc`,
 `test_rpc_shared`, `test_rpcb`, `test_tls`; `-Soak` adds `test_soak`), then each example's
-server and client on ports 23401 to 23410 of 127.0.0.1 (`-BasePort` moves
+server and client on ports 23401 to 23411 of 127.0.0.1 (`-BasePort` moves
 them), skipping `06_portmap`, and exits with 0 if everything passed. If PowerShell refuses
 to run scripts, use `powershell -ExecutionPolicy Bypass -File
 tests\run_tests.ps1`.
@@ -296,7 +296,7 @@ and example passes, TLS included (`tests\run_tests.ps1`, and `-Soak`).
 | `test_xdr`   | XDR primitives against hand-worked byte layouts, bounds, failures |
 | `test_xspec` | the `.x` parser: every construct, error messages and line numbers |
 | `test_gen`   | generated XDR code for every declaration form: encode, decode, re-encode, truncated input; with make, the generated client, server and both skeletons are also built with `-Werror` |
-| `test_rpc`   | a client and a server in one loop: 200 concurrent calls, deferred replies, TCP and UDP, timeouts, retransmission, cancellation, refused connections, unknown hosts, reconnection, a server closing while requests are open, the same calls over a local socket (with the caller's uid and gid, a path already in use, the socket file removed on close), the UDP duplicate-request cache (replays, ignored resends, expiry, eviction, size limits), the server limits (connections, outstanding requests, pausing and resuming connections, idle timeout), and two out-of-memory sweeps that fail each allocation in turn and check that nothing leaks |
+| `test_rpc`   | a client and a server in one loop: 200 concurrent calls, deferred replies, TCP and UDP, timeouts, retransmission, cancellation, refused connections, unknown hosts, reconnection, a server closing while requests are open, the same calls over a local socket (with the caller's uid and gid, a path already in use, the socket file removed on close), the UDP duplicate-request cache (replays, ignored resends, expiry, eviction, size limits), the server limits (connections, outstanding requests, pausing and resuming connections, idle timeout), custom authentication (a made-up flavor with signed call and reply verifiers, refreshed credentials over TCP and UDP, many calls in flight, authenticators that turn away AUTH_NONE and choose AUTH_SYS callers), deferred replies (the abandon callback when the caller or the server goes, set late, cancelled, never run for answered requests), cancelling single calls (before they are sent, while the server holds them, from callbacks, while closing, and over UDP, where resending stops), and out-of-memory sweeps of plain calls and of authentication that fail each allocation in turn and check that nothing leaks |
 | `test_tls`   | RPC-with-TLS: the AUTH_TLS request and the STARTTLS answer byte by byte; calls over TLS (many at once, a 300 KB string there and back); the server's certificate checked against a trusted authority, its DNS name and its IP address, and checking switched off; mutual TLS with a client certificate required, missing or untrusted, and the subject the server sees; a server without TLS; a server requiring TLS (refusing plain TCP and UDP, allowing local sockets); a TLS connection closed when idle and remade; configuration errors. The certificates are in `tests/tls_certs.h` |
 | `check-alloc`| (make only) `nm` check that the library never references the C allocator |
 | `check-exports` | (make only) the shared library exports every function declared `ONCRPC_API` and nothing else |
@@ -317,7 +317,7 @@ calls. The seed fixes the relay's and the clients' decisions, but which
 datagram meets which decision also depends on timing, so a failing seed
 makes a failure likely to recur rather than certain.
 
-The examples use ports 23401 to 23410 on 127.0.0.1, below the range from
+The examples use ports 23401 to 23411 on 127.0.0.1, below the range from
 which systems assign ports automatically (so that no connection left over
 from an earlier test can be holding one); set `ONCRPC_TEST_PORT` (make) or
 `-BasePort` (PowerShell) to move them.

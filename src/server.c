@@ -91,6 +91,14 @@ typedef struct drcEntry {
     uint8_t          peerKeyLen;
 } drcEntry;
 
+/* An authenticator for one flavor (oncRPCServerSetAuth). */
+typedef struct sauth {
+    uint32_t         flavor;
+    oncRPCSvcAuthFn  fn;
+    void            *ctx;
+    struct sauth    *next;
+} sauth;
+
 typedef struct sreg {
     uint32_t         prog;
     uint32_t         vers;
@@ -120,6 +128,16 @@ typedef struct svcCall {
     int                     hasCred;   /* local: the caller's uid and gid */
     uint32_t                uid;
     uint32_t                gid;
+    oncRPCAuthData         *credVerf;  /* [0] credential, [1] verifier; NULL: none */
+    oncRPCAuthData         *replyVerf; /* set by oncRPCSvcSetReplyVerf */
+    int                     abandoned; /* the reply can no longer be delivered */
+    oncRPCSvcAbandonCb      abandonCb;
+    void                   *abandonData;
+    int                     queued;    /* on srv->notifyQ */
+    struct svcCall         *qnext;
+    struct svcCall         *qprev;
+    struct svcCall         *snext;     /* in srv->reqs: every outstanding request */
+    struct svcCall         *sprev;
     struct svcCall         *next;      /* in conn->reqs */
     struct svcCall         *prev;
 } svcCall;
@@ -140,6 +158,12 @@ struct oncRPCServer {
     slistener             *listeners;
     sconn                 *conns;
     sreg                  *regs;
+    sauth                 *auths;
+    svcCall               *reqs;          /* every outstanding request */
+    svcCall               *notifyQ;       /* abandoned requests to tell about */
+    svcCall               *notifyTail;
+    uv_idle_t              notify;        /* runs abandon callbacks */
+    int                    notifyOpen;    /* notify initialised, not closed */
     oncRPCServerLimits     lim;
     oncRPCServerStats      stats;
     size_t                 pendingReqs;   /* dispatched, not finished */
@@ -450,10 +474,23 @@ static void maybe_finish_close(oncRPCServer *s)
 
     if (!s->closing || s->activeCloses > 0 || s->pendingReqs > 0 || s->activeOps > 0)
         return;
+    if (s->notifyOpen) {
+        /* Kept open until now: abandon callbacks are what lets outstanding
+         * requests finish while the server closes. */
+        s->notifyOpen = 0;
+        s->activeCloses++;
+        uv_close((uv_handle_t *)&s->notify, on_handle_closed);
+        return;
+    }
     while (s->regs != NULL) {
         sreg *r = s->regs;
         s->regs = r->next;
         oncRPCFree(s->alloc, r);
+    }
+    while (s->auths != NULL) {
+        sauth *a = s->auths;
+        s->auths = a->next;
+        oncRPCFree(s->alloc, a);
     }
     cb = s->closeCb;
     data = s->closeData;
@@ -483,9 +520,79 @@ static void peer_unref(oncRPCServer *s, tlsPeer *p)
         oncRPCFree(s->alloc, p);
 }
 
+/* ---- Abandoned requests ------------------------------------------------------------ */
+
+static void notify_unqueue(oncRPCServer *s, svcCall *r)
+{
+    if (!r->queued)
+        return;
+    r->queued = 0;
+    if (r->qprev)
+        r->qprev->qnext = r->qnext;
+    else
+        s->notifyQ = r->qnext;
+    if (r->qnext)
+        r->qnext->qprev = r->qprev;
+    else
+        s->notifyTail = r->qprev;
+    r->qnext = r->qprev = NULL;
+}
+
+static void on_notify(uv_idle_t *h)
+{
+    oncRPCServer *s = (oncRPCServer *)h->data;
+
+    (void)uv_idle_stop(h);
+    /* A callback may finish this request or others; finishing takes a
+     * request off the queue, so always start again from the head. */
+    while (s->notifyQ != NULL) {
+        svcCall *r = s->notifyQ;
+        oncRPCSvcAbandonCb cb = r->abandonCb;
+        notify_unqueue(s, r);
+        r->abandonCb = NULL;   /* once */
+        if (cb != NULL && !r->finished)
+            cb(&r->pub, r->abandonData);
+    }
+}
+
+/* Queue the abandon callback of r if it has one and is due. */
+static void notify_queue(oncRPCServer *s, svcCall *r)
+{
+    if (!r->abandoned || r->abandonCb == NULL || r->finished || r->queued)
+        return;
+    r->queued = 1;
+    r->qnext = NULL;
+    r->qprev = s->notifyTail;
+    if (s->notifyTail)
+        s->notifyTail->qnext = r;
+    else
+        s->notifyQ = r;
+    s->notifyTail = r;
+    if (s->notifyOpen)
+        (void)uv_idle_start(&s->notify, on_notify);
+}
+
+static void abandon(svcCall *r)
+{
+    if (r->abandoned)
+        return;
+    r->abandoned = 1;
+    notify_queue(r->srv, r);
+}
+
 static void release(svcCall *r)
 {
     oncRPCServer *s = r->srv;
+
+    notify_unqueue(s, r);
+    if (r->sprev)
+        r->sprev->snext = r->snext;
+    else
+        s->reqs = r->snext;
+    if (r->snext)
+        r->snext->sprev = r->sprev;
+    oncRPCFree(s->alloc, r->credVerf);
+    oncRPCFree(s->alloc, r->replyVerf);
 
     if (r->args != NULL) {
         oncRPCXdrFree(s->alloc, r->xargs, r->args);
@@ -676,8 +783,17 @@ static int begin_reply(svcCall *r, oncRPCXdr *x, uint32_t reply_stat)
 static int encode_accepted(svcCall *r, oncRPCXdr *x, uint32_t stat, uint32_t low,
                            uint32_t high)
 {
-    if (!begin_reply(r, x, ONCRPC_MSG_ACCEPTED) || !put_u32(x, ONCRPC_AUTH_NONE) ||
-        !put_u32(x, 0) || !put_u32(x, stat))
+    if (!begin_reply(r, x, ONCRPC_MSG_ACCEPTED))
+        return 0;
+    if (r->replyVerf != NULL) {
+        oncRPCAuthData *v = r->replyVerf;
+        if (!put_u32(x, v->flavor) || !put_u32(x, v->len) ||
+            !oncRPCXdrOpaque(x, v->body, v->len))
+            return 0;
+    } else if (!put_u32(x, ONCRPC_AUTH_NONE) || !put_u32(x, 0)) {
+        return 0;
+    }
+    if (!put_u32(x, stat))
         return 0;
     if (stat == ONCRPC_ACCEPT_PROG_MISMATCH)
         return put_u32(x, low) && put_u32(x, high);
@@ -885,6 +1001,88 @@ oncRPCStat oncRPCServerSetTls(oncRPCServer *s, oncRPCTlsConfig *cfg, int require
     return ONCRPC_OK;
 }
 
+static const oncRPCAuthData none_auth = { ONCRPC_AUTH_NONE, 0, { 0 } };
+
+const oncRPCAuthData *oncRPCSvcCred(const oncRPCSvcReq *req)
+{
+    const svcCall *r = (const svcCall *)(const void *)req;
+    if (r == NULL || r->credVerf == NULL)
+        return &none_auth;
+    return &r->credVerf[0];
+}
+
+const oncRPCAuthData *oncRPCSvcVerf(const oncRPCSvcReq *req)
+{
+    const svcCall *r = (const svcCall *)(const void *)req;
+    if (r == NULL || r->credVerf == NULL)
+        return &none_auth;
+    return &r->credVerf[1];
+}
+
+oncRPCStat oncRPCSvcSetReplyVerf(oncRPCSvcReq *req, uint32_t flavor, const uint8_t *body,
+                                 uint32_t len)
+{
+    svcCall *r = ONCRPC_REQ(req);
+    if (r == NULL || r->finished || len > ONCRPC_MAX_AUTH_BYTES || (len > 0 && body == NULL))
+        return ONCRPC_ERR_INVALID;
+    if (r->replyVerf == NULL) {
+        r->replyVerf = (oncRPCAuthData *)oncRPCAlloc(r->srv->alloc, sizeof(oncRPCAuthData));
+        if (r->replyVerf == NULL)
+            return ONCRPC_ERR_NOMEM;
+    }
+    r->replyVerf->flavor = flavor;
+    r->replyVerf->len = len;
+    if (len > 0)
+        memcpy(r->replyVerf->body, body, len);
+    return ONCRPC_OK;
+}
+
+oncRPCStat oncRPCServerSetAuth(oncRPCServer *s, uint32_t flavor, oncRPCSvcAuthFn fn, void *ctx)
+{
+    sauth **pp, *a;
+
+    if (s == NULL || s->closing || flavor == ONCRPC_AUTH_TLS)
+        return ONCRPC_ERR_INVALID;
+    for (pp = &s->auths; *pp != NULL; pp = &(*pp)->next)
+        if ((*pp)->flavor == flavor)
+            break;
+    if (fn == NULL) {
+        if (*pp != NULL) {
+            a = *pp;
+            *pp = a->next;
+            oncRPCFree(s->alloc, a);
+        }
+        return ONCRPC_OK;
+    }
+    if (*pp == NULL) {
+        a = (sauth *)oncRPCAlloc(s->alloc, sizeof(*a));
+        if (a == NULL)
+            return ONCRPC_ERR_NOMEM;
+        a->flavor = flavor;
+        *pp = a;
+    }
+    (*pp)->fn = fn;
+    (*pp)->ctx = ctx;
+    return ONCRPC_OK;
+}
+
+int oncRPCSvcAbandoned(const oncRPCSvcReq *req)
+{
+    const svcCall *r = (const svcCall *)(const void *)req;
+    return r == NULL || r->abandoned;
+}
+
+void oncRPCSvcSetAbandonCb(oncRPCSvcReq *req, oncRPCSvcAbandonCb cb, void *data)
+{
+    svcCall *r = ONCRPC_REQ(req);
+    if (r == NULL || r->finished)
+        return;
+    notify_unqueue(r->srv, r);
+    r->abandonCb = cb;
+    r->abandonData = data;
+    notify_queue(r->srv, r);
+}
+
 int oncRPCSvcLocalCred(const oncRPCSvcReq *req, uint32_t *uid, uint32_t *gid)
 {
     const svcCall *r = (const svcCall *)(const void *)req;
@@ -909,6 +1107,8 @@ static int handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCPr
     oncRPCOpaqueAuth cred, verf;
     uint32_t mtype, rpcvers, low = UINT32_MAX, high = 0;
     sreg *g, *match = NULL;
+    sauth *au;
+    size_t hdrlen = 0;
     int found_prog = 0;
 
     if (s->closing)
@@ -945,6 +1145,10 @@ static int handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCPr
         r->drc = drc;
         drc->req = r;
     }
+    r->snext = s->reqs;
+    if (s->reqs)
+        s->reqs->sprev = r;
+    s->reqs = r;
     s->pendingReqs++;
     s->stats.requests++;
 
@@ -955,7 +1159,7 @@ static int handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCPr
     }
     if (!oncRPCXdrUint32(&x, &r->pub.prog) || !oncRPCXdrUint32(&x, &r->pub.vers) ||
         !oncRPCXdrUint32(&x, &r->pub.proc) || !oncRPCIntXdrOpaqueAuth(&x, &cred) ||
-        !oncRPCIntXdrOpaqueAuth(&x, &verf)) {
+        (hdrlen = oncRPCXdrGetPos(&x), !oncRPCIntXdrOpaqueAuth(&x, &verf))) {
         reply_accepted(r, ONCRPC_ACCEPT_GARBAGE_ARGS, 0, 0);
         return 1;
     }
@@ -982,6 +1186,24 @@ static int handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCPr
         reply_denied(r, ONCRPC_REJ_AUTH_ERROR, ONCRPC_AUTH_TOOWEAK, 0);
         return 1;
     }
+    for (au = s->auths; au != NULL; au = au->next)
+        if (au->flavor == cred.flavor)
+            break;
+    if (cred.flavor != ONCRPC_AUTH_NONE || cred.len > 0 || verf.flavor != ONCRPC_AUTH_NONE ||
+        verf.len > 0) {
+        /* Kept for oncRPCSvcCred/Verf. The layouts are the same. */
+        r->credVerf = (oncRPCAuthData *)oncRPCAlloc(s->alloc, 2 * sizeof(oncRPCAuthData));
+        if (r->credVerf == NULL) {
+            reply_accepted(r, ONCRPC_ACCEPT_SYSTEM_ERR, 0, 0);
+            return 1;
+        }
+        r->credVerf[0].flavor = cred.flavor;
+        r->credVerf[0].len = cred.len;
+        memcpy(r->credVerf[0].body, cred.body, cred.len);
+        r->credVerf[1].flavor = verf.flavor;
+        r->credVerf[1].len = verf.len;
+        memcpy(r->credVerf[1].body, verf.body, verf.len);
+    }
     if (cred.flavor == ONCRPC_AUTH_SYS) {
         oncRPCXdr ax;
         oncRPCXdrInitDecode(&ax, NULL, cred.body, cred.len);
@@ -990,9 +1212,23 @@ static int handle_call(oncRPCServer *s, const uint8_t *msg, size_t len, oncRPCPr
             return 1;
         }
         r->pub.authSys = &r->sys;
-    } else if (cred.flavor != ONCRPC_AUTH_NONE) {
+    } else if (cred.flavor != ONCRPC_AUTH_NONE && au == NULL) {
         reply_denied(r, ONCRPC_REJ_AUTH_ERROR, ONCRPC_AUTH_REJECTEDCRED, 0);
         return 1;
+    }
+    if (au != NULL) {
+        oncRPCAuthStat why;
+        r->inDispatch = 1;   /* so that finishing it here cannot free it */
+        why = au->fn(&r->pub, msg, hdrlen, au->ctx);
+        r->inDispatch = 0;
+        if (r->finished) {   /* not allowed, but survive it */
+            release(r);
+            return 1;
+        }
+        if (why != ONCRPC_AUTH_OK) {
+            reply_denied(r, ONCRPC_REJ_AUTH_ERROR, (uint32_t)why, 0);
+            return 1;
+        }
     }
 
     for (g = s->regs; g != NULL; g = g->next) {
@@ -1054,8 +1290,10 @@ static void conn_close(sconn *c)
     }
     s->nconns--;
     /* Outstanding requests survive; their replies will be discarded. */
-    for (r = c->reqs; r != NULL; r = r->next)
+    for (r = c->reqs; r != NULL; r = r->next) {
         r->conn = NULL;
+        abandon(r);
+    }
     c->reqs = NULL;
     if (c->prev)
         c->prev->next = c->next;
@@ -1447,6 +1685,17 @@ oncRPCStat oncRPCServerCreate(uv_loop_t *loop, const oncRPCAllocator *alloc, onc
         uv_close((uv_handle_t *)&s->tick, on_handle_closed);
         return ONCRPC_ERR_FAILED;
     }
+    if (uv_idle_init(loop, &s->notify) != 0) {
+        s->closing = 1;
+        s->tick.data = s;
+        s->resume.data = s;
+        s->activeCloses = 2;
+        uv_close((uv_handle_t *)&s->tick, on_handle_closed);
+        uv_close((uv_handle_t *)&s->resume, on_handle_closed);
+        return ONCRPC_ERR_FAILED;
+    }
+    s->notifyOpen = 1;
+    s->notify.data = s;
     s->tick.data = s;
     s->resume.data = s;
     /* Housekeeping alone must not keep the loop running. */
@@ -1546,6 +1795,13 @@ void oncRPCServerClose(oncRPCServer *s, oncRPCCloseCb cb, void *data)
     while (s->conns != NULL)
         conn_close(s->conns);
     /* Requests still outstanding now hold no listener; replies are dropped. */
+    {
+        svcCall *r;
+        for (r = s->reqs; r != NULL; r = r->snext) {
+            r->lis = NULL;
+            abandon(r);
+        }
+    }
     maybe_finish_close(s);
 }
 

@@ -7,7 +7,12 @@
  *     connection refused, unknown host
  *  3. lifecycle: server close waits for outstanding requests; a TCP client
  *     reconnects after the server restarts
- *  4. allocation: all memory returned; the out-of-memory sweep fails the
+ *  4. authentication: custom flavors on both sides, reply verifiers,
+ *     refreshing credentials, authenticators for AUTH_NONE and AUTH_SYS
+ *  5. deferred replies: abandonment when the caller or the server goes
+ *  6. cancelling single calls: before sending, while held, from callbacks,
+ *     while closing, and over UDP (no more resends)
+ *  7. allocation: all memory returned; the out-of-memory sweep fails the
  *     n-th allocation for every n and checks the loop still winds down
  *     with nothing leaked
  */
@@ -1041,6 +1046,623 @@ static void limits(void)
 
 /* ---- 6. Out-of-memory sweep -------------------------------------------------------- */
 
+/* ---- 7. Authentication -------------------------------------------------------------- */
+
+/*
+ * A made-up flavor, TOKEN: the credential body is a password, the call's
+ * verifier is a checksum of the header, and the reply's verifier is xid + 1.
+ * Its own program, so the dispatch routine can look at what it got.
+ */
+#define T_PROG   0x2000F00Du
+#define T_VERS   1u
+#define T_NULL   0u
+#define T_WHO    1u      /* returns the length of req->authCtx's text, or 0 */
+#define T_HOLD   2u      /* held in g_t.held until the test finishes it */
+#define T_TOKEN  390001u
+
+static uint32_t fnv(const uint8_t *p, size_t n)
+{
+    uint32_t h = 2166136261u;
+    while (n-- > 0)
+        h = (h ^ *p++) * 16777619u;
+    return h;
+}
+
+static struct {
+    /* server side */
+    const char   *password;     /* what the authenticator accepts */
+    int           authRuns;
+    int           wrongReplyVerf;
+    int           dispatched;
+    uint32_t      credFlavor, credLen, verfFlavor;
+    oncRPCSvcReq *held[4];
+    int           nheld;
+    int           abandonRuns;
+    int           abandonedInCb;
+    int           dropInCb;
+    int           autoAbandon;  /* T_HOLD sets t_abandoned itself */
+    /* client side */
+    const char   *token;        /* what the client sends */
+    int           credRuns, verfRuns, validateRuns, refreshRuns, releaseRuns;
+    int           refreshFixes; /* refresh switches token to "good" */
+    oncRPCAuthStat lastWhy;
+} g_t;
+
+static const char g_identity[] = "alice";
+static void t_abandoned(oncRPCSvcReq *req, void *data);
+
+static void t_dispatch(oncRPCSvcReq *req)
+{
+    uint32_t n;
+    const oncRPCAuthData *cr = oncRPCSvcCred(req), *vf = oncRPCSvcVerf(req);
+    g_t.dispatched++;
+    g_t.credFlavor = cr->flavor;
+    g_t.credLen = cr->len;
+    g_t.verfFlavor = vf->flavor;
+    switch (req->proc) {
+    case T_NULL:
+        (void)oncRPCSvcReply(req, NULL, NULL);
+        break;
+    case T_WHO:
+        n = req->authCtx != NULL ? (uint32_t)strlen((const char *)req->authCtx) : 0;
+        (void)oncRPCSvcReply(req, (oncRPCXdrProc)oncRPCXdrUint32, &n);
+        break;
+    case T_HOLD:
+        if (g_t.nheld < 4)
+            g_t.held[g_t.nheld++] = req;
+        else
+            oncRPCSvcErrSystem(req);
+        if (g_t.autoAbandon)
+            oncRPCSvcSetAbandonCb(req, t_abandoned, &g_t);
+        break;
+    default:
+        oncRPCSvcErrNoProc(req);
+    }
+}
+
+static oncRPCAuthStat t_auth_token(oncRPCSvcReq *req, const uint8_t *header, size_t len,
+                                   void *ctx)
+{
+    const oncRPCAuthData *cr = oncRPCSvcCred(req), *vf = oncRPCSvcVerf(req);
+    uint8_t rv[4];
+    uint32_t want = req->xid + (g_t.wrongReplyVerf ? 7u : 1u);
+    (void)ctx;
+    g_t.authRuns++;
+    if (cr->len != strlen(g_t.password) || memcmp(cr->body, g_t.password, cr->len) != 0)
+        return ONCRPC_AUTH_REJECTEDCRED;
+    if (vf->flavor != T_TOKEN || vf->len != 4 || get32(vf->body) != fnv(header, len))
+        return ONCRPC_AUTH_BADVERF;
+    put32(rv, want);
+    if (oncRPCSvcSetReplyVerf(req, T_TOKEN, rv, 4) != ONCRPC_OK)
+        return ONCRPC_AUTH_FAILED;   /* out of memory (the sweep below) */
+    req->authCtx = (void *)g_identity;
+    return ONCRPC_AUTH_OK;
+}
+
+static oncRPCAuthStat t_auth_none(oncRPCSvcReq *req, const uint8_t *header, size_t len,
+                                  void *ctx)
+{
+    (void)req; (void)header; (void)len; (void)ctx;
+    g_t.authRuns++;
+    return ONCRPC_AUTH_TOOWEAK;
+}
+
+static oncRPCAuthStat t_auth_sys(oncRPCSvcReq *req, const uint8_t *header, size_t len,
+                                 void *ctx)
+{
+    (void)header; (void)len;
+    g_t.authRuns++;
+    if (req->authSys == NULL || req->authSys->uid != *(const uint32_t *)ctx)
+        return ONCRPC_AUTH_TOOWEAK;
+    return ONCRPC_AUTH_OK;
+}
+
+static int c_cred(void *data, uint32_t xid, uint32_t proc, oncRPCAuthData *cred)
+{
+    size_t n = strlen(g_t.token);
+    (void)data; (void)xid; (void)proc;
+    g_t.credRuns++;
+    cred->flavor = T_TOKEN;
+    cred->len = (uint32_t)n;
+    memcpy(cred->body, g_t.token, n);
+    return 0;
+}
+
+static int c_verf(void *data, const uint8_t *header, size_t len, oncRPCAuthData *verf)
+{
+    (void)data;
+    g_t.verfRuns++;
+    verf->flavor = T_TOKEN;
+    verf->len = 4;
+    put32(verf->body, fnv(header, len));
+    return 0;
+}
+
+static int c_validate(void *data, uint32_t xid, const oncRPCAuthData *verf)
+{
+    (void)data;
+    g_t.validateRuns++;
+    return verf->flavor == T_TOKEN && verf->len == 4 && get32(verf->body) == xid + 1 ? 0 : -1;
+}
+
+static int c_refresh(void *data, oncRPCAuthStat why)
+{
+    (void)data;
+    g_t.refreshRuns++;
+    g_t.lastWhy = why;
+    if (g_t.refreshFixes)
+        g_t.token = "good";
+    return 1;
+}
+
+static void c_release(void *data)
+{
+    (void)data;
+    g_t.releaseRuns++;
+}
+
+static int c_cred_fail(void *data, uint32_t xid, uint32_t proc, oncRPCAuthData *cred)
+{
+    (void)data; (void)xid; (void)proc; (void)cred;
+    return -1;
+}
+
+static const oncRPCClientAuth token_auth = { c_cred, c_verf, c_validate, c_refresh, c_release };
+static const oncRPCClientAuth failing_auth = { c_cred_fail, NULL, NULL, NULL, NULL };
+
+typedef struct tstate {
+    int        calls;
+    oncRPCStat stat;
+    oncRPCAuthStat why;
+} tstate;
+
+static void t_call(oncRPCClient *c, oncRPCStat st, void *res, void *data)
+{
+    tstate *t = (tstate *)data;
+    (void)res;
+    t->calls++;
+    t->stat = st;
+    t->why = oncRPCClientLastError(c)->why;
+}
+
+/* One call of proc; returns its status (and the result in *out). */
+static oncRPCStat t_one(oncRPCClient *c, uint32_t proc, uint32_t *out, oncRPCAuthStat *why)
+{
+    tstate t;
+    uint32_t arg = 0, res = 0;
+    memset(&t, 0, sizeof(t));
+    CHECK(oncRPCClientCall(c, proc, (oncRPCXdrProc)oncRPCXdrUint32, &arg,
+                           proc == T_WHO ? (oncRPCXdrProc)oncRPCXdrUint32 : NULL,
+                           proc == T_WHO ? &res : NULL, t_call, &t) == ONCRPC_OK);
+    WAIT(t.calls == 1);
+    if (out != NULL)
+        *out = res;
+    if (why != NULL)
+        *why = t.why;
+    return t.stat;
+}
+
+static oncRPCServer *t_server(void)
+{
+    oncRPCServer *s = NULL;
+    CHECK(oncRPCServerCreate(&g_loop, &A, &s) == ONCRPC_OK);
+    CHECK(oncRPCServerListen(s, ONCRPC_PROTO_TCP, "127.0.0.1", 0) == ONCRPC_OK);
+    CHECK(oncRPCServerListen(s, ONCRPC_PROTO_UDP, "127.0.0.1",
+                             oncRPCServerPort(s, ONCRPC_PROTO_TCP)) == ONCRPC_OK);
+    CHECK(oncRPCServerRegister(s, T_PROG, T_VERS, t_dispatch, NULL) == ONCRPC_OK);
+    return s;
+}
+
+static void authentication(void)
+{
+    oncRPCServer *s;
+    oncRPCClient *c, *u;
+    oncRPCAuthStat why;
+    uint32_t n = 0, uid = 4242;
+    uint16_t port;
+    int i;
+
+    memset(&g_t, 0, sizeof(g_t));
+    s = t_server();
+    port = oncRPCServerPort(s, ONCRPC_PROTO_TCP);
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, T_PROG, T_VERS, ONCRPC_PROTO_TCP,
+                             NULL, NULL, &c) == ONCRPC_OK);
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, T_PROG, T_VERS, ONCRPC_PROTO_UDP,
+                             NULL, NULL, &u) == ONCRPC_OK);
+
+    /* Argument checks. */
+    CHECK(oncRPCServerSetAuth(s, ONCRPC_AUTH_TLS, t_auth_none, NULL) == ONCRPC_ERR_INVALID);
+    CHECK(oncRPCServerSetAuth(NULL, T_TOKEN, t_auth_token, NULL) == ONCRPC_ERR_INVALID);
+    {
+        static const oncRPCClientAuth nocred = { NULL, NULL, NULL, NULL, NULL };
+        CHECK(oncRPCClientSetAuth(c, &nocred, NULL) == ONCRPC_ERR_INVALID);
+        CHECK(oncRPCClientSetAuth(c, NULL, NULL) == ONCRPC_ERR_INVALID);
+    }
+
+    /* AUTH_NONE: the dispatch routine sees an empty credential and verifier. */
+    CHECK(t_one(c, T_NULL, NULL, NULL) == ONCRPC_OK);
+    CHECK(g_t.credFlavor == ONCRPC_AUTH_NONE && g_t.credLen == 0 &&
+          g_t.verfFlavor == ONCRPC_AUTH_NONE);
+
+    /* An unknown flavor is refused while no authenticator handles it. */
+    g_t.token = "good";
+    CHECK(oncRPCClientSetAuth(c, &token_auth, NULL) == ONCRPC_OK);
+    g_t.dispatched = 0;
+    CHECK(t_one(c, T_NULL, NULL, &why) == ONCRPC_ERR_AUTHERROR);
+    CHECK(why == ONCRPC_AUTH_REJECTEDCRED);
+    CHECK(g_t.refreshRuns == 2 && g_t.lastWhy == ONCRPC_AUTH_REJECTEDCRED);
+    CHECK(g_t.credRuns == 3 && g_t.verfRuns == 3);   /* the call and two refreshes */
+    CHECK(g_t.dispatched == 0);
+
+    /* With one: the credential and verifier are checked, the authenticator
+     * hands the identity to the dispatch routine, the reply's verifier is
+     * checked by the client. */
+    g_t.password = "good";
+    CHECK(oncRPCServerSetAuth(s, T_TOKEN, t_auth_token, NULL) == ONCRPC_OK);
+    g_t.refreshRuns = g_t.credRuns = g_t.validateRuns = 0;
+    CHECK(t_one(c, T_WHO, &n, NULL) == ONCRPC_OK);
+    CHECK(n == 5);   /* "alice" */
+    CHECK(g_t.credFlavor == T_TOKEN && g_t.credLen == 4 && g_t.verfFlavor == T_TOKEN);
+    CHECK(g_t.validateRuns == 1 && g_t.refreshRuns == 0 && g_t.credRuns == 1);
+
+    /* A wrong password: refresh fixes it, the call goes through. */
+    g_t.token = "bad!";
+    g_t.refreshFixes = 1;
+    g_t.refreshRuns = g_t.credRuns = 0;
+    n = 0;
+    CHECK(t_one(c, T_WHO, &n, NULL) == ONCRPC_OK && n == 5);
+    CHECK(g_t.refreshRuns == 1 && g_t.credRuns == 2);
+    CHECK(g_t.lastWhy == ONCRPC_AUTH_REJECTEDCRED);
+    /* Over UDP as well. */
+    CHECK(oncRPCClientSetAuth(u, &token_auth, NULL) == ONCRPC_OK);
+    g_t.token = "bad!";
+    g_t.refreshRuns = 0;
+    n = 0;
+    CHECK(t_one(u, T_WHO, &n, NULL) == ONCRPC_OK && n == 5);
+    CHECK(g_t.refreshRuns == 1);
+
+    /* Refreshing that does not help gives up after two tries. */
+    g_t.token = "bad!";
+    g_t.refreshFixes = 0;
+    g_t.refreshRuns = g_t.authRuns = 0;
+    CHECK(t_one(c, T_WHO, NULL, &why) == ONCRPC_ERR_AUTHERROR);
+    CHECK(why == ONCRPC_AUTH_REJECTEDCRED && g_t.refreshRuns == 2 && g_t.authRuns == 3);
+
+    /* A reply verifier that does not check out fails the call. */
+    g_t.token = "good";
+    g_t.wrongReplyVerf = 1;
+    g_t.refreshRuns = 0;
+    CHECK(t_one(c, T_WHO, NULL, &why) == ONCRPC_ERR_AUTHERROR);
+    CHECK(why == ONCRPC_AUTH_INVALIDRESP && g_t.refreshRuns == 0);
+    g_t.wrongReplyVerf = 0;
+
+    /* A credential the client cannot produce fails at once; the old
+     * authentication was released when this one was set. */
+    g_t.releaseRuns = 0;
+    CHECK(oncRPCClientSetAuth(c, &failing_auth, NULL) == ONCRPC_OK);
+    CHECK(g_t.releaseRuns == 1);
+    CHECK(oncRPCClientCall(c, T_NULL, NULL, NULL, NULL, NULL, t_call, NULL) ==
+          ONCRPC_ERR_CANTENCODE);
+
+    /* An authenticator for AUTH_NONE turns unauthenticated callers away;
+     * removing it lets them in again. */
+    CHECK(oncRPCClientSetAuthNone(c) == ONCRPC_OK);
+    CHECK(oncRPCServerSetAuth(s, ONCRPC_AUTH_NONE, t_auth_none, NULL) == ONCRPC_OK);
+    CHECK(t_one(c, T_NULL, NULL, &why) == ONCRPC_ERR_AUTHERROR && why == ONCRPC_AUTH_TOOWEAK);
+    CHECK(oncRPCServerSetAuth(s, ONCRPC_AUTH_NONE, NULL, NULL) == ONCRPC_OK);
+    CHECK(t_one(c, T_NULL, NULL, NULL) == ONCRPC_OK);
+
+    /* An authenticator for AUTH_SYS sees the decoded credential. */
+    CHECK(oncRPCServerSetAuth(s, ONCRPC_AUTH_SYS, t_auth_sys, &uid) == ONCRPC_OK);
+    CHECK(oncRPCClientSetAuthSys(c, "box", 1000, 100, 0, NULL) == ONCRPC_OK);
+    CHECK(t_one(c, T_NULL, NULL, &why) == ONCRPC_ERR_AUTHERROR && why == ONCRPC_AUTH_TOOWEAK);
+    CHECK(oncRPCClientSetAuthSys(c, "box", 4242, 100, 0, NULL) == ONCRPC_OK);
+    CHECK(t_one(c, T_NULL, NULL, NULL) == ONCRPC_OK);
+    CHECK(g_t.credFlavor == ONCRPC_AUTH_SYS && g_t.credLen > 0);
+
+    /* Many calls in flight with the custom flavor, some refreshed. */
+    CHECK(oncRPCClientSetAuth(c, &token_auth, NULL) == ONCRPC_OK);
+    g_t.token = "good";
+    {
+        tstate ts[20];
+        uint32_t res[20], arg = 0;
+        memset(ts, 0, sizeof(ts));
+        for (i = 0; i < 20; i++) {
+            res[i] = 0;
+            CHECK(oncRPCClientCall(c, T_WHO, (oncRPCXdrProc)oncRPCXdrUint32, &arg,
+                                   (oncRPCXdrProc)oncRPCXdrUint32, &res[i], t_call,
+                                   &ts[i]) == ONCRPC_OK);
+            if (i == 9)
+                g_t.token = "bad!";   /* the rest are refused once */
+        }
+        g_t.refreshFixes = 1;
+        for (i = 0; i < 20; i++) {
+            WAIT(ts[i].calls == 1);
+            CHECK(ts[i].stat == ONCRPC_OK && res[i] == 5);
+        }
+    }
+
+    /* Closing the client releases its authentication. */
+    g_t.releaseRuns = 0;
+    g_closed = 0;
+    oncRPCClientClose(c, on_closed, NULL);
+    oncRPCClientClose(u, on_closed, NULL);
+    WAIT(g_closed == 2);
+    CHECK(g_t.releaseRuns == 2);
+    oncRPCServerClose(s, NULL, NULL);
+    run();
+}
+
+/* ---- 8. Deferred replies ---------------------------------------------------------- */
+
+static void t_abandoned(oncRPCSvcReq *req, void *data)
+{
+    g_t.abandonRuns++;
+    CHECK(data == (void *)&g_t);
+    g_t.abandonedInCb = oncRPCSvcAbandoned(req);
+    if (g_t.dropInCb) {
+        int i;
+        for (i = 0; i < g_t.nheld; i++)
+            if (g_t.held[i] == req)
+                g_t.held[i] = g_t.held[--g_t.nheld];
+        oncRPCSvcDrop(req);
+    }
+}
+
+static void deferred(void)
+{
+    oncRPCServer *s;
+    oncRPCClient *c;
+    tstate t, tu;   /* tu: completes after the block that uses it */
+    uint16_t port;
+    uint32_t arg = 0;
+
+    memset(&g_t, 0, sizeof(g_t));
+    s = t_server();
+    port = oncRPCServerPort(s, ONCRPC_PROTO_TCP);
+
+    /* The caller goes away: the callback runs, from the loop, and the
+     * request can be dropped there. */
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, T_PROG, T_VERS, ONCRPC_PROTO_TCP,
+                             NULL, NULL, &c) == ONCRPC_OK);
+    memset(&t, 0, sizeof(t));
+    CHECK(oncRPCClientCall(c, T_HOLD, NULL, NULL, NULL, NULL, t_call, &t) == ONCRPC_OK);
+    WAIT(g_t.nheld == 1);
+    CHECK(!oncRPCSvcAbandoned(g_t.held[0]));
+    g_t.dropInCb = 1;
+    oncRPCSvcSetAbandonCb(g_t.held[0], t_abandoned, &g_t);
+    CHECK(g_t.abandonRuns == 0);
+    g_closed = 0;
+    oncRPCClientClose(c, on_closed, NULL);
+    WAIT(g_closed == 1 && g_t.abandonRuns == 1);
+    CHECK(g_t.abandonedInCb && g_t.nheld == 0);
+    CHECK(t.calls == 1 && t.stat == ONCRPC_ERR_CANCELLED);
+    WAIT(oncRPCServerPending(s) == 0);
+
+    /* Set after the connection is gone: runs soon, not inside the call.
+     * A reply to an abandoned request goes nowhere but finishes it. */
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, T_PROG, T_VERS, ONCRPC_PROTO_TCP,
+                             NULL, NULL, &c) == ONCRPC_OK);
+    memset(&t, 0, sizeof(t));
+    CHECK(oncRPCClientCall(c, T_HOLD, NULL, NULL, NULL, NULL, t_call, &t) == ONCRPC_OK);
+    CHECK(oncRPCClientCall(c, T_HOLD, NULL, NULL, NULL, NULL, t_call, &t) == ONCRPC_OK);
+    WAIT(g_t.nheld == 2);
+    g_closed = 0;
+    oncRPCClientClose(c, on_closed, NULL);
+    WAIT(g_closed == 1 && oncRPCSvcAbandoned(g_t.held[0]) && oncRPCSvcAbandoned(g_t.held[1]));
+    g_t.abandonRuns = 0;
+    g_t.dropInCb = 0;
+    oncRPCSvcSetAbandonCb(g_t.held[0], t_abandoned, &g_t);
+    CHECK(g_t.abandonRuns == 0);
+    uv_run(&g_loop, UV_RUN_NOWAIT);
+    CHECK(g_t.abandonRuns == 1);
+    /* Cancelled before it could run: never runs. */
+    oncRPCSvcSetAbandonCb(g_t.held[1], t_abandoned, &g_t);
+    oncRPCSvcSetAbandonCb(g_t.held[1], NULL, NULL);
+    uv_run(&g_loop, UV_RUN_NOWAIT);
+    CHECK(g_t.abandonRuns == 1);
+    CHECK(oncRPCSvcReply(g_t.held[0], NULL, NULL) == 1);
+    oncRPCSvcDrop(g_t.held[1]);
+    g_t.nheld = 0;
+    CHECK(oncRPCServerPending(s) == 0);
+
+    /* Answered in time: the callback never runs. */
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, T_PROG, T_VERS, ONCRPC_PROTO_TCP,
+                             NULL, NULL, &c) == ONCRPC_OK);
+    memset(&t, 0, sizeof(t));
+    CHECK(oncRPCClientCall(c, T_HOLD, NULL, NULL, NULL, NULL, t_call, &t) == ONCRPC_OK);
+    WAIT(g_t.nheld == 1);
+    g_t.abandonRuns = 0;
+    oncRPCSvcSetAbandonCb(g_t.held[0], t_abandoned, &g_t);
+    CHECK(oncRPCSvcReply(g_t.held[0], NULL, NULL) == 1);
+    g_t.nheld = 0;
+    WAIT(t.calls == 1);
+    CHECK(t.stat == ONCRPC_OK);
+    g_closed = 0;
+    oncRPCClientClose(c, on_closed, NULL);
+    WAIT(g_closed == 1);
+    uv_run(&g_loop, UV_RUN_NOWAIT);
+    CHECK(g_t.abandonRuns == 0);
+
+    /* The server closes with requests outstanding over TCP and UDP: each is
+     * told, drops itself, and the close completes. */
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, T_PROG, T_VERS, ONCRPC_PROTO_TCP,
+                             NULL, NULL, &c) == ONCRPC_OK);
+    {
+        oncRPCClient *u;
+        CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, T_PROG, T_VERS,
+                                 ONCRPC_PROTO_UDP, NULL, NULL, &u) == ONCRPC_OK);
+        oncRPCClientSetTimeout(u, 2000);
+        memset(&t, 0, sizeof(t));
+        memset(&tu, 0, sizeof(tu));
+        CHECK(oncRPCClientCall(c, T_HOLD, (oncRPCXdrProc)oncRPCXdrUint32, &arg, NULL, NULL,
+                               t_call, &t) == ONCRPC_OK);
+        CHECK(oncRPCClientCall(u, T_HOLD, NULL, NULL, NULL, NULL, t_call, &tu) == ONCRPC_OK);
+        WAIT(g_t.nheld == 2);
+        g_t.abandonRuns = 0;
+        g_t.dropInCb = 1;
+        oncRPCSvcSetAbandonCb(g_t.held[0], t_abandoned, &g_t);
+        oncRPCSvcSetAbandonCb(g_t.held[1], t_abandoned, &g_t);
+        g_closed = 0;
+        oncRPCServerClose(s, on_closed, NULL);
+        CHECK(g_t.abandonRuns == 0);   /* not from inside oncRPCServerClose */
+        CHECK(oncRPCSvcAbandoned(g_t.held[0]) && oncRPCSvcAbandoned(g_t.held[1]));
+        WAIT(g_closed == 1);
+        CHECK(g_t.abandonRuns == 2 && g_t.nheld == 0);
+        WAIT(t.calls == 1);
+        CHECK(t.stat == ONCRPC_ERR_CANTRECV);
+        oncRPCClientClose(u, NULL, NULL);
+        oncRPCClientClose(c, NULL, NULL);
+    }
+    run();
+    CHECK(tu.calls == 1 && tu.stat == ONCRPC_ERR_CANCELLED);
+}
+
+/* ---- 9. Cancelling calls ------------------------------------------------------------ */
+
+typedef struct cstate {
+    int        calls;
+    oncRPCStat stat;
+    int        inCancel;       /* set while oncRPCClientCancel runs */
+    int        ranInCancel;    /* the callback ran inside it: must not */
+    oncRPCCallId other;        /* cancel this from the callback */
+    oncRPCStat otherStat;
+    oncRPCStat selfStat;       /* cancelling itself from its callback */
+    oncRPCCallId self;
+} cstate;
+
+static void c_done(oncRPCClient *c, oncRPCStat st, void *res, void *data)
+{
+    cstate *t = (cstate *)data;
+    (void)res;
+    t->calls++;
+    t->stat = st;
+    if (t->inCancel)
+        t->ranInCancel = 1;
+    if (t->other != 0)
+        t->otherStat = oncRPCClientCancel(c, t->other);
+    if (t->self != 0)
+        t->selfStat = oncRPCClientCancel(c, t->self);
+}
+
+static void cancelling(uint16_t port)
+{
+    oncRPCServer *s;
+    oncRPCClient *c, *u;
+    cstate t[4];
+    oncRPCCallId id[4];
+    int32_t sum[4], x = 5, held = -12345, two = 2;
+    int i, adds;
+
+    s = start_server(port);
+    CHECK(s != NULL);
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, CALC_PROG, CALC_VERS,
+                             ONCRPC_PROTO_TCP, NULL, NULL, &c) == ONCRPC_OK);
+
+    /* Nothing to cancel yet; bad arguments. */
+    CHECK(oncRPCClientLastCall(c) == 0);
+    CHECK(oncRPCClientLastCall(NULL) == 0);
+    CHECK(oncRPCClientCancel(c, 0) == ONCRPC_ERR_INVALID);
+    CHECK(oncRPCClientCancel(c, 99) == ONCRPC_ERR_INVALID);
+    CHECK(oncRPCClientCancel(NULL, 1) == ONCRPC_ERR_INVALID);
+
+    /* A call cancelled before the client is even connected is never sent. */
+    memset(t, 0, sizeof(t));
+    adds = g_adds;
+    CHECK(oncRPCCalcAddV1(c, &x, &two, &sum[0], c_done, &t[0]) == ONCRPC_OK);
+    id[0] = oncRPCClientLastCall(c);
+    CHECK(id[0] != 0);
+    t[0].inCancel = 1;
+    CHECK(oncRPCClientCancel(c, id[0]) == ONCRPC_OK);
+    t[0].inCancel = 0;
+    CHECK(t[0].calls == 0);   /* not from inside the call */
+    CHECK(oncRPCClientCancel(c, id[0]) == ONCRPC_ERR_INVALID);   /* only once */
+    CHECK(oncRPCCalcAddV1(c, &x, &two, &sum[1], c_done, &t[1]) == ONCRPC_OK);
+    id[1] = oncRPCClientLastCall(c);
+    CHECK(id[1] > id[0]);
+    WAIT(t[0].calls == 1 && t[1].calls == 1);
+    CHECK(!t[0].ranInCancel && t[0].stat == ONCRPC_ERR_CANCELLED);
+    CHECK(t[1].stat == ONCRPC_OK && sum[1] == 7);
+    CHECK(g_adds == adds + 1);   /* the server ran only the second */
+    CHECK(oncRPCClientCancel(c, id[1]) == ONCRPC_ERR_INVALID);   /* completed */
+
+    /* Calls the server is holding: cancelling one leaves the others, and its
+     * late reply is ignored. */
+    memset(t, 0, sizeof(t));
+    memset(sum, 0, sizeof(sum));
+    g_nheld = 0;
+    for (i = 0; i < 3; i++) {
+        CHECK(oncRPCCalcAddV1(c, &x, &held, &sum[i], c_done, &t[i]) == ONCRPC_OK);
+        id[i] = oncRPCClientLastCall(c);
+    }
+    CHECK(id[0] != id[1] && id[1] != id[2]);
+    WAIT(g_nheld == 3);
+    CHECK(oncRPCClientCancel(c, id[1]) == ONCRPC_OK);
+    CHECK(oncRPCClientPending(c) == 3);   /* until its callback has run */
+    WAIT(t[1].calls == 1);
+    CHECK(t[1].stat == ONCRPC_ERR_CANCELLED);
+    CHECK(oncRPCClientPending(c) == 2);
+    reply_held();
+    WAIT(t[0].calls == 1 && t[2].calls == 1);
+    CHECK(t[0].stat == ONCRPC_OK && sum[0] == 5 - 12345);
+    CHECK(t[2].stat == ONCRPC_OK && sum[2] == 5 - 12345);
+    CHECK(t[1].calls == 1 && sum[1] == 0);   /* its reply was not decoded */
+
+    /* From a callback: cancelling another call works, cancelling itself
+     * does not (it has completed). */
+    memset(t, 0, sizeof(t));
+    g_nheld = 0;
+    CHECK(oncRPCCalcAddV1(c, &x, &two, &sum[0], c_done, &t[0]) == ONCRPC_OK);
+    t[0].self = oncRPCClientLastCall(c);
+    CHECK(oncRPCCalcAddV1(c, &x, &held, &sum[1], c_done, &t[1]) == ONCRPC_OK);
+    t[0].other = oncRPCClientLastCall(c);
+    WAIT(t[0].calls == 1 && t[1].calls == 1);
+    CHECK(t[0].stat == ONCRPC_OK && t[0].selfStat == ONCRPC_ERR_INVALID);
+    CHECK(t[0].otherStat == ONCRPC_OK && t[1].stat == ONCRPC_ERR_CANCELLED);
+    WAIT(g_nheld == 1);
+    release_held();
+
+    /* While the client closes: still accepted; the call completes cancelled,
+     * once. */
+    memset(t, 0, sizeof(t));
+    CHECK(oncRPCCalcAddV1(c, &x, &held, &sum[0], c_done, &t[0]) == ONCRPC_OK);
+    id[0] = oncRPCClientLastCall(c);
+    WAIT(g_nheld == 1);
+    g_closed = 0;
+    oncRPCClientClose(c, on_closed, NULL);
+    CHECK(oncRPCClientCancel(c, id[0]) == ONCRPC_OK);
+    WAIT(g_closed == 1);
+    CHECK(t[0].calls == 1 && t[0].stat == ONCRPC_ERR_CANCELLED);
+    release_held();
+
+    /* UDP: a cancelled call is no longer resent. */
+    CHECK(oncRPCClientCreate(&g_loop, &A, "127.0.0.1", port, CALC_PROG, CALC_VERS,
+                             ONCRPC_PROTO_UDP, NULL, NULL, &u) == ONCRPC_OK);
+    oncRPCClientSetRetry(u, 20);
+    memset(t, 0, sizeof(t));
+    g_nheld = 0;
+    CHECK(oncRPCCalcAddV1(u, &x, &held, &sum[0], c_done, &t[0]) == ONCRPC_OK);
+    id[0] = oncRPCClientLastCall(u);
+    WAIT(g_nheld == 1);
+    sleep_ms(70);   /* resent a few times by now */
+    {
+        uint64_t before;
+        CHECK(STAT(s, duplicatesDropped) > 0);
+        CHECK(oncRPCClientCancel(u, id[0]) == ONCRPC_OK);
+        WAIT(t[0].calls == 1);
+        CHECK(t[0].stat == ONCRPC_ERR_CANCELLED);
+        before = STAT(s, duplicatesDropped);
+        sleep_ms(100);
+        CHECK(STAT(s, duplicatesDropped) == before);
+    }
+    release_held();
+    g_closed = 0;
+    oncRPCClientClose(u, on_closed, NULL);
+    oncRPCServerClose(s, on_closed, NULL);
+    WAIT(g_closed == 2);
+    run();
+}
+
 typedef struct ostate {
     int           pending;     /* clients still open */
     oncRPCServer *srv;
@@ -1090,6 +1712,70 @@ static void o_guard(uv_timer_t *t)
     abort();
 }
 
+/* Custom authentication with a refresh, a reply verifier and a held
+ * request that is abandoned when the client goes. */
+static struct {
+    oncRPCServer *srv;
+    uv_timer_t    guard;
+    uint32_t      res;
+} g_oa;
+
+static void oa_client_closed(void *data)
+{
+    (void)data;
+    oncRPCServerClose(g_oa.srv, NULL, NULL);
+    uv_close((uv_handle_t *)&g_oa.guard, NULL);
+}
+
+static void oa_who(oncRPCClient *c, oncRPCStat st, void *res, void *data)
+{
+    (void)st; (void)res; (void)data;
+    oncRPCClientClose(c, oa_client_closed, NULL);
+}
+
+static long oom_auth_scenario(long fail_at)
+{
+    oncRPCClient *c = NULL;
+    uint32_t arg = 0;
+    int ok;
+
+    memset(&g_t, 0, sizeof(g_t));
+    memset(&g_oa, 0, sizeof(g_oa));
+    g_t.password = "good";
+    g_t.token = "bad!";
+    g_t.refreshFixes = 1;
+    g_t.dropInCb = 1;
+    g_t.autoAbandon = 1;
+    g_allocs = 0;
+    g_fail_at = fail_at;
+    uv_timer_init(&g_loop, &g_oa.guard);
+    uv_timer_start(&g_oa.guard, o_guard, 10000, 0);
+    ok = oncRPCServerCreate(&g_loop, &A, &g_oa.srv) == ONCRPC_OK;
+    if (ok)
+        ok = oncRPCServerListen(g_oa.srv, ONCRPC_PROTO_TCP, "127.0.0.1", 0) == ONCRPC_OK &&
+             oncRPCServerRegister(g_oa.srv, T_PROG, T_VERS, t_dispatch, NULL) == ONCRPC_OK &&
+             oncRPCServerSetAuth(g_oa.srv, T_TOKEN, t_auth_token, NULL) == ONCRPC_OK &&
+             oncRPCClientCreate(&g_loop, &A, "127.0.0.1",
+                                oncRPCServerPort(g_oa.srv, ONCRPC_PROTO_TCP), T_PROG, T_VERS,
+                                ONCRPC_PROTO_TCP, NULL, NULL, &c) == ONCRPC_OK;
+    if (ok) {
+        oncRPCClientSetTimeout(c, 300);
+        (void)oncRPCClientSetAuth(c, &token_auth, NULL);
+        (void)oncRPCClientCall(c, T_HOLD, NULL, NULL, NULL, NULL, NULL, NULL);
+        if (oncRPCClientCall(c, T_WHO, (oncRPCXdrProc)oncRPCXdrUint32, &arg,
+                             (oncRPCXdrProc)oncRPCXdrUint32, &g_oa.res, oa_who,
+                             NULL) != ONCRPC_OK)
+            oncRPCClientClose(c, oa_client_closed, NULL);
+    } else {
+        if (g_oa.srv != NULL)
+            oncRPCServerClose(g_oa.srv, NULL, NULL);
+        uv_close((uv_handle_t *)&g_oa.guard, NULL);
+    }
+    run();
+    g_fail_at = -1;
+    return g_allocs;
+}
+
 /* Returns the number of allocations the scenario made. */
 static long oom_scenario(long fail_at)
 {
@@ -1136,16 +1822,16 @@ static long oom_scenario(long fail_at)
     return g_allocs;
 }
 
-static void oom_sweep(int rest)
+static void oom_sweep(long (*scenario)(long), const char *name, int rest)
 {
     long total, n, failures = 0;
 
     g_fail_rest = rest;
-    total = oom_scenario(-1);
+    total = scenario(-1);
     CHECK(total > 20);
     CHECK(g_live == 0);
     for (n = 0; n <= total; n++) {
-        oom_scenario(n);
+        scenario(n);
         if (g_live != 0) {
             fprintf(stderr, "out-of-memory at allocation %ld leaked %ld blocks\n", n, g_live);
             failures++;
@@ -1156,7 +1842,7 @@ static void oom_sweep(int rest)
     g_count++;
     if (failures)
         g_fail++;
-    printf("  out-of-memory sweep (%s): %ld allocation points, %ld leaking\n",
+    printf("  out-of-memory sweep, %s (%s): %ld allocation points, %ld leaking\n", name,
            rest ? "every allocation from n on fails" : "allocation n fails", total + 1, failures);
 }
 
@@ -1215,9 +1901,20 @@ int main(void)
     printf("  server limits\n");
     limits();
     CHECK(g_live == 0);
+    printf("  authentication\n");
+    authentication();
+    CHECK(g_live == 0);
+    printf("  deferred replies\n");
+    deferred();
+    CHECK(g_live == 0);
+    printf("  cancelling calls\n");
+    cancelling(port);
+    CHECK(g_live == 0);
 
-    oom_sweep(0);
-    oom_sweep(1);
+    oom_sweep(oom_scenario, "calls", 0);
+    oom_sweep(oom_scenario, "calls", 1);
+    oom_sweep(oom_auth_scenario, "authentication", 0);
+    oom_sweep(oom_auth_scenario, "authentication", 1);
 
     CHECK(uv_loop_close(&g_loop) == 0);
     CHECK(g_live == 0);

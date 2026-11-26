@@ -92,7 +92,7 @@ if ($Soak) {
 
 # ---- Examples -------------------------------------------------------------------
 
-$examples = '01_add', '02_strings', '03_shapes', '04_lists', '05_async', '07_errors'
+$examples = '01_add', '02_strings', '03_shapes', '04_lists', '05_async', '07_errors', '11_auth'
 
 foreach ($example in $examples) {
     $port = $BasePort + [int]$example.Substring(0, 2)

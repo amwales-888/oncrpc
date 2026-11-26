@@ -11,6 +11,11 @@ liboncrpc is a clean-room C99 implementation of:
 - **The XDR/RPC language**: `.x` files, with a parser and the `oncrpcgen`
   code generator for client stubs, server dispatch and XDR routines
 
+New to the library? Start with the tutorial, `docs/TUTORIAL.md`. Every
+public function has a manual page, with an example, in `docs/man/` (the
+index is `docs/man/README.md`). This file describes the library topic by
+topic.
+
 Design rules:
 
 - **Asynchronous, on your libuv loop.** Nothing blocks. Operations start
@@ -348,10 +353,30 @@ How clients behave:
   `oncRPCClientLastError(clnt)` inside the callback gives the version range for
   `ONCRPC_ERR_PROGVERSMISMATCH`/`ONCRPC_ERR_VERSMISMATCH`, the `oncRPCAuthStat`
   for `ONCRPC_ERR_AUTHERROR`, and the libuv error behind transport failures.
+- **Cancelling one call.** Every call gets an id; read it with
+  `oncRPCClientLastCall(clnt)` straight after starting the call (also after
+  a generated stub), and pass it to `oncRPCClientCancel(clnt, id)`:
+
+  ```c
+  oncRPCAddV1(client, &a, &b, &sum, on_add_done, NULL);
+  oncRPCCallId id = oncRPCClientLastCall(client);
+  ...
+  oncRPCClientCancel(client, id);   /* on_add_done gets ONCRPC_ERR_CANCELLED */
+  ```
+
+  The callback runs from the event loop soon after, never inside
+  `oncRPCClientCancel`, and a reply that arrives later is ignored. A call
+  not yet sent is never sent, and UDP stops resending it; but one already
+  sent may have been carried out by the server. Cancelling a call that has
+  already completed returns `ONCRPC_ERR_INVALID`.
 - **Closing.** `oncRPCClientClose` completes outstanding calls with
   `ONCRPC_ERR_CANCELLED`, then runs its callback.
 - **Loop lifetime.** A client keeps the loop alive only while it has calls
   outstanding (an idle connection is `uv_unref`'d).
+- **Credentials.** `oncRPCClientSetAuthNone` (the default),
+  `oncRPCClientSetAuthSys` and `oncRPCClientSetAuthSysDefault` choose the
+  standard flavors; `oncRPCClientSetAuth` plugs in any other (see
+  "Authentication" in section 7). The choice applies to calls made after it.
 - **Raw calls.** Calls without generated stubs:
   `oncRPCClientCall(clnt, proc, xargs, &args, xres, &res, cb, data)`.
 - **Threads.** Handles are not thread-safe; use them on their loop's thread.
@@ -400,7 +425,8 @@ How servers behave:
   arguments stay valid, so replies can be as asynchronous as you like.
 - **Request details.** `req` describes the call: `req->proc`, `req->vers`,
   `req->proto`, `req->credFlavor`, `req->authSys` (machine name, uid, gid
-  and groups for AUTH_SYS) and `req->ctx` (the pointer given at registration).
+  and groups for AUTH_SYS), `req->ctx` (the pointer given at registration)
+  and `req->authCtx` (whatever an authenticator left there).
   `oncRPCSvcPeer(req, buf, len)` gives the caller's address.
 - **Rejecting callers.** `oncRPCSvcErrAuth(req, ONCRPC_AUTH_TOOWEAK)`
   rejects the credentials.
@@ -423,7 +449,8 @@ How servers behave:
   requests have been finished (their replies are discarded).
   `oncRPCServerPending(srv)` tells how many are left.
 - **Lost connections.** If a TCP connection drops while a request is
-  outstanding, the request stays valid; its reply is discarded.
+  outstanding, the request stays valid; its reply is discarded. See
+  "Deferred replies" below for finding out when that happens.
 - **Resent UDP requests.** A UDP client that hears nothing resends its
   request. The server remembers recent UDP requests and their replies (the
   duplicate-request cache), so a resend does not run the procedure twice:
@@ -586,6 +613,89 @@ oncRPCTlsConfigFree(tls);
 
 `examples/10_tls` shows both sides, with mutual TLS.
 
+### Authentication
+
+Every call carries a credential and a verifier, each a flavor number and up
+to 400 bytes. The library understands AUTH_NONE and AUTH_SYS itself; any
+other flavor is plugged in by the application, on each side.
+
+On the **client**, `oncRPCClientSetAuth(client, &auth, data)` takes a
+struct of functions, each given `data`:
+
+| Function | Called | Does |
+|---|---|---|
+| `credential(data, xid, proc, &cred)` | for every call (required) | writes the call's credential: flavor, length, body |
+| `verifier(data, header, len, &verf)` | for every call (may be NULL: empty AUTH_NONE verifier) | writes the call's verifier; `header` is the encoded call from the xid to the end of the credential, for verifiers that sign it |
+| `validate(data, xid, &verf)` | for every accepted reply (may be NULL) | checks the reply's verifier; returning -1 fails the call with `ONCRPC_ERR_AUTHERROR`, reason `ONCRPC_AUTH_INVALIDRESP` |
+| `refresh(data, why)` | when the server refuses the credential (may be NULL) | returning 1 sends the call again, with a new xid and a fresh credential and verifier; at most twice per call |
+| `release(data)` | when another authentication is set or the client closes (may be NULL) | frees whatever `data` holds |
+
+The functions run inside `oncRPCClientCall` and while replies are
+handled, so they must not call functions of the same client. The struct
+must stay valid while it is in use; a `static const` one is simplest.
+
+On the **server**, an authenticator checks every request of one flavor
+before it is dispatched:
+
+```c
+static oncRPCAuthStat check(oncRPCSvcReq *req, const uint8_t *header, size_t len, void *ctx)
+{
+    const oncRPCAuthData *cred = oncRPCSvcCred(req);   /* flavor, len, body */
+    const oncRPCAuthData *verf = oncRPCSvcVerf(req);
+    /* ... check them; header/len is what the client's verifier function saw ... */
+    oncRPCSvcSetReplyVerf(req, MY_FLAVOR, body, n);    /* optional */
+    req->authCtx = the_user;                            /* for the procedures */
+    return ONCRPC_AUTH_OK;                              /* or a reason to refuse */
+}
+
+oncRPCServerSetAuth(server, MY_FLAVOR, check, NULL);
+```
+
+- A refused request is answered with AUTH_ERROR and the returned reason;
+  the procedure never runs.
+- Without an authenticator, AUTH_NONE and AUTH_SYS requests are let
+  through and other flavors are refused with `ONCRPC_AUTH_REJECTEDCRED`.
+  An authenticator for AUTH_NONE or AUTH_SYS adds a check: one that always
+  refuses turns those callers away, one for AUTH_SYS can decide by
+  `req->authSys->uid` (already decoded when it runs).
+- `oncRPCSvcCred` and `oncRPCSvcVerf` work in procedures too, until the
+  request is finished.
+- The reply verifier set with `oncRPCSvcSetReplyVerf` goes with accepted
+  replies, successful or not; rejections carry none.
+- `examples/11_auth` is a complete client and server.
+
+Only the credential and verifier are pluggable: a flavor that also wraps
+the arguments and results (RPCSEC_GSS integrity and privacy) is not
+supported. For privacy, use TLS.
+
+### Deferred replies
+
+A procedure may return without answering and finish the request later, as
+`examples/05_async` does. Meanwhile the caller may go away: its connection
+closes, or the server starts closing. The request then stays valid - it
+still has to be finished, and the server does not finish closing until it
+is - but its reply goes nowhere. Two functions tell you:
+
+- `oncRPCSvcAbandoned(req)` is non-zero once that has happened.
+- `oncRPCSvcSetAbandonCb(req, cb, data)` has `cb(req, data)` run, once,
+  when it happens, so the work can stop and the request be dropped:
+
+```c
+static void on_abandoned(oncRPCSvcReq *req, void *data)
+{
+    stop_the_work(data);
+    oncRPCSvcDrop(req);
+}
+...
+oncRPCSvcSetAbandonCb(req, on_abandoned, job);
+```
+
+The callback runs from the event loop, never inside a library call (not
+even inside `oncRPCServerClose`), and soon after `oncRPCSvcSetAbandonCb` if
+the request is already abandoned. It does not run for a request finished
+before then; `NULL` cancels it. A UDP request is abandoned only when the
+server closes.
+
 ### Dispatch without generated code
 
 ```c
@@ -624,6 +734,7 @@ decoded arguments belong to the request.
 | Call arguments | Encoded before the stub / `oncRPCClientCall` returns: stack data is fine. |
 | Call results | Your storage, zero-initialised (stubs zero it), valid until the callback. On `ONCRPC_OK`, release decoded contents with `oncRPCXdrFreeT(alloc, res)` (or `oncRPCFree` for a string). On failure, any partial decode has already been freed. |
 | Server arguments | Owned by the request; valid until the request is finished. |
+| Credential and verifier | `oncRPCSvcCred`/`oncRPCSvcVerf` results belong to the request; valid until it is finished. |
 | Server results | Encoded by the reply call and not retained: stack data and string literals are fine. |
 | Handles | Closed asynchronously; memory is released just before the close callback runs. |
 | Allocator | Must outlive every object created with it. |
@@ -682,10 +793,12 @@ checked once at the end. Use `ONCRPC_XDR_UNBOUNDED` as the maximum for `<>`.
 | `oncRPCClientCreate(loop, alloc, host, port, prog, vers, proto, readyCb, data, &clnt)` | start connecting; `port` 0 asks the host's rpcbind; for `ONCRPC_PROTO_LOCAL`, `host` is the socket's path |
 | `oncRPCClientClose(clnt, cb, data)` | cancel outstanding calls, close |
 | `oncRPCClientCall(clnt, proc, xargs, args, xres, res, cb, data)` | start a call |
+| `oncRPCClientLastCall(clnt)` / `oncRPCClientCancel(clnt, id)` | id of the call just started; cancel one call |
 | `oncRPCClientSetTimeout(clnt, ms)` | total time per call (default 25000) |
 | `oncRPCClientSetRetry(clnt, ms)` | UDP retransmit interval (default 1000) |
 | `oncRPCClientSetMaxRecord(clnt, bytes)` | largest TCP reply accepted (default 16 MiB) |
 | `oncRPCClientSetAuthNone(clnt)` / `SetAuthSys(...)` / `SetAuthSysDefault(clnt)` | credentials |
+| `oncRPCClientSetAuth(clnt, &auth, data)` | any other flavor (section 7, "Authentication") |
 | `oncRPCClientSetTls(clnt, cfg, serverName)` | use TLS on the client's TCP connections |
 | `oncRPCClientLastError(clnt)` | details of the call being reported (`detail` for `ONCRPC_ERR_TLS`) |
 | `oncRPCClientData(clnt)` / `oncRPCClientAllocator(clnt)` / `oncRPCClientPending(clnt)` | accessors |
@@ -746,6 +859,10 @@ first. `"127.0.0.1.4.1"` and `"::1.4.1"` are port 4 * 256 + 1 = 1025.
 | `oncRPCSvcReply(req, xres, res)` / `oncRPCSvcDrop(req)` | finish a request |
 | `oncRPCSvcErrNoProc / ErrDecode / ErrSystem / ErrNoProg / ErrProgVers / ErrAuth` | error replies |
 | `oncRPCSvcPeer(req, buf, len)` | caller address |
+| `oncRPCServerSetAuth(srv, flavor, fn, ctx)` | check requests of a flavor before dispatch; `fn` NULL removes |
+| `oncRPCSvcCred(req)` / `oncRPCSvcVerf(req)` | the request's credential and verifier as received |
+| `oncRPCSvcSetReplyVerf(req, flavor, body, len)` | the verifier sent with the reply |
+| `oncRPCSvcAbandoned(req)` / `oncRPCSvcSetAbandonCb(req, cb, data)` | whether the reply can still be delivered; be told when it no longer can |
 | `oncRPCSvcLocalCred(req, &uid, &gid)` | caller's user and group over a local socket (not on Windows) |
 | `oncRPCServerSetTls(srv, cfg, required)` | offer (or require) TLS on TCP connections |
 | `oncRPCSvcTls(req)` / `oncRPCSvcTlsPeer(req, buf, len)` | whether the request came over TLS; the client certificate's subject |
@@ -802,8 +919,11 @@ oncRPCXSpecFree(spec);
 ## 12. Limits and conformance notes
 
 - **Authentication.** AUTH_NONE and AUTH_SYS on both sides, and AUTH_TLS
-  for starting TLS. Servers reject other flavors with `AUTH_REJECTEDCRED`.
-  Reply verifiers are AUTH_NONE.
+  for starting TLS. Other flavors are supplied by the application
+  (`oncRPCClientSetAuth`, `oncRPCServerSetAuth`); without an authenticator
+  servers reject them with `AUTH_REJECTEDCRED`. Flavors that wrap arguments
+  and results (RPCSEC_GSS integrity and privacy) are not supported, and
+  neither AUTH_SHORT nor AUTH_DH is provided.
 - **TLS.** RFC 9289 on TCP: TLS 1.3 only, with the ALPN protocol id the RFC
   registers (offered by clients; a server refuses a client that offers
   ALPN without it, and accepts one that offers no ALPN at all). Not

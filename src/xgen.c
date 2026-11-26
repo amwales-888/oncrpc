@@ -1207,7 +1207,9 @@ static void gen_server_skeleton(gen *g)
                 for (k = 0; pr->nargs > 1 && k < pr->nargs; k++)
                     P(g, "    (void)arg%u;\n", (unsigned)(k + 1));
                 P(g, "    /* TODO: implement %s. To answer later, keep req and call\n"
-                     "     * %sReply() when the result is ready. */\n", pr->name, fn);
+                     "     * %sReply() when the result is ready; meanwhile\n"
+                     "     * oncRPCSvcSetAbandonCb() tells if the caller goes away. */\n",
+                  pr->name, fn);
                 if (pr->result.kind == ONCRPC_XTYPE_VOID)
                     P(g, "    (void)%sReply(req);\n}\n\n", fn);
                 else if (pr->result.kind == ONCRPC_XTYPE_STRING)

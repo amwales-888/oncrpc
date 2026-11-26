@@ -45,6 +45,7 @@ run_pair 04_lists   $((BASE + 4))
 run_pair 05_async   $((BASE + 5))
 run_pair 07_errors  $((BASE + 7))
 run_pair 10_tls     $((BASE + 10))   # certificates from examples/10_tls/certs
+run_pair 11_auth    $((BASE + 11))
 
 echo "== 06_portmap"
 if command -v rpcinfo > /dev/null 2>&1 && rpcinfo -p 127.0.0.1 > /dev/null 2>&1; then

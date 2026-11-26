@@ -34,7 +34,7 @@
 extern "C" {
 #endif
 
-#define ONCRPC_VERSION_STRING     "4.1.0"
+#define ONCRPC_VERSION_STRING     "4.3.0"
 #define ONCRPC_PROTOCOL_VERSION   2u          /* RPC message protocol version */
 #define ONCRPC_MAX_AUTH_BYTES     400u        /* opaque_auth body limit */
 #define ONCRPC_MAX_MACHINENAME    255u
@@ -91,7 +91,8 @@ typedef enum oncRPCProto {
     ONCRPC_PROTO_LOCAL = 256
 } oncRPCProto;
 
-/* Authentication flavors. The library implements NONE and SYS. */
+/* Authentication flavors. The library implements NONE and SYS itself;
+ * others can be added with oncRPCClientSetAuth and oncRPCServerSetAuth. */
 typedef enum oncRPCAuthFlavor {
     ONCRPC_AUTH_NONE  = 0,
     ONCRPC_AUTH_SYS   = 1,
@@ -168,6 +169,14 @@ typedef struct oncRPCAuthSysParams {
     uint32_t gids[ONCRPC_MAX_GIDS];
 } oncRPCAuthSysParams;
 
+/* A credential or verifier as it travels: a flavor and up to
+ * ONCRPC_MAX_AUTH_BYTES of opaque body. */
+typedef struct oncRPCAuthData {
+    uint32_t flavor;
+    uint32_t len;
+    uint8_t  body[ONCRPC_MAX_AUTH_BYTES];
+} oncRPCAuthData;
+
 typedef void (*oncRPCCloseCb)(void *data);
 
 /* ---- Library ------------------------------------------------------------ */
@@ -224,6 +233,24 @@ ONCRPC_API oncRPCStat oncRPCClientCall(oncRPCClient *clnt, uint32_t proc,
                                        oncRPCXdrProc xres, void *res,
                                        oncRPCCallCb cb, void *data);
 
+/*
+ * Calls can be cancelled one at a time. Each call a client starts gets an
+ * id, unique for that client and never 0; oncRPCClientLastCall returns the
+ * id of the call most recently started by oncRPCClientCall (or a generated
+ * stub calling it), so read it straight after starting the call. 0 if none.
+ */
+typedef uint64_t oncRPCCallId;
+ONCRPC_API oncRPCCallId oncRPCClientLastCall(const oncRPCClient *clnt);
+/*
+ * Cancel an outstanding call: its callback runs with ONCRPC_ERR_CANCELLED
+ * from the event loop, soon after (never inside this function), and a reply
+ * that arrives later is ignored. A call not yet sent is never sent; one
+ * already sent may still have been carried out by the server. Returns
+ * ONCRPC_OK, or ONCRPC_ERR_INVALID if the call has already completed,
+ * already been cancelled or failed, or is unknown.
+ */
+ONCRPC_API oncRPCStat oncRPCClientCancel(oncRPCClient *clnt, oncRPCCallId id);
+
 /* Total time allowed per call, from oncRPCClientCall (default 25 s). */
 ONCRPC_API void oncRPCClientSetTimeout(oncRPCClient *clnt, uint32_t ms);
 /* UDP retransmission interval (default 1 s). */
@@ -238,6 +265,46 @@ ONCRPC_API oncRPCStat oncRPCClientSetAuthSys(oncRPCClient *clnt, const char *mac
                                              const uint32_t *gids);
 /* Use AUTH_SYS with the identity of the current process. */
 ONCRPC_API oncRPCStat oncRPCClientSetAuthSysDefault(oncRPCClient *clnt);
+
+/*
+ * Any other authentication: the application supplies the credential and
+ * verifier of each call and checks the verifier of each reply. Only
+ * credential is required; the other functions may be NULL. They run inside
+ * oncRPCClientCall and while replies are handled, and must not call
+ * functions of this client. data is passed to each of them.
+ */
+typedef struct oncRPCClientAuth {
+    /* Fill in the credential of the call with this xid and procedure.
+     * Return 0, or -1 to refuse (the call fails with ONCRPC_ERR_CANTENCODE). */
+    int  (*credential)(void *data, uint32_t xid, uint32_t proc, oncRPCAuthData *cred);
+    /* Fill in the call's verifier. header holds the call as encoded so far,
+     * from the xid to the end of the credential, for verifiers that sign it.
+     * Return 0 or -1 as above. NULL: an empty AUTH_NONE verifier. */
+    int  (*verifier)(void *data, const uint8_t *header, size_t len, oncRPCAuthData *verf);
+    /* Check the verifier of an accepted reply. Return 0 if it is good; -1
+     * fails the call with ONCRPC_ERR_AUTHERROR and reason
+     * ONCRPC_AUTH_INVALIDRESP, without decoding the results. NULL: any
+     * verifier is accepted. */
+    int  (*validate)(void *data, uint32_t xid, const oncRPCAuthData *verf);
+    /* The server refused the credentials of a call (AUTH_ERROR, reason why).
+     * Return 1 to send the call again with a new xid and fresh credential
+     * and verifier (at most twice per call), 0 to let it fail. NULL: never
+     * retry. */
+    int  (*refresh)(void *data, oncRPCAuthStat why);
+    /* The client has stopped using this authentication: another was set or
+     * the client closed. May be NULL. */
+    void (*release)(void *data);
+} oncRPCClientAuth;
+
+/*
+ * Use auth (which must stay valid while in use, typically a static const
+ * struct) for subsequent calls. Calls already started keep the credentials
+ * they were encoded with; their replies are checked with validate and
+ * refreshed only while the same authentication is set. Setting AUTH_NONE
+ * or AUTH_SYS afterwards releases it.
+ */
+ONCRPC_API oncRPCStat oncRPCClientSetAuth(oncRPCClient *clnt, const oncRPCClientAuth *auth,
+                                          void *data);
 /* Details of the most recently completed call; valid in call callbacks. */
 ONCRPC_API const oncRPCError *oncRPCClientLastError(const oncRPCClient *clnt);
 ONCRPC_API void *oncRPCClientData(const oncRPCClient *clnt);
@@ -316,8 +383,13 @@ typedef struct oncRPCSvcPriv oncRPCSvcPriv;
  * An incoming call. It stays valid until it is answered with
  * oncRPCSvcReply or an oncRPCSvcErr* function, or released with
  * oncRPCSvcDrop - which may happen inside the dispatch routine or at any
- * later time (asynchronous replies). Every request must be finished exactly
+ * later time (deferred replies). Every request must be finished exactly
  * once; a server does not complete closing while requests are outstanding.
+ *
+ * A request answered later outlives anything it came from: if its
+ * connection closes or the server starts closing first, the request stays
+ * valid and still has to be finished, but its reply goes nowhere. See
+ * oncRPCSvcAbandoned and oncRPCSvcSetAbandonCb.
  */
 typedef struct oncRPCSvcReq {
     uint32_t                   xid;
@@ -330,6 +402,10 @@ typedef struct oncRPCSvcReq {
     void                      *ctx;         /* from oncRPCServerRegister */
     oncRPCServer              *server;
     oncRPCSvcPriv             *priv;        /* internal */
+    /* Free for an authenticator (oncRPCServerSetAuth) to leave something for
+     * the dispatch routine, such as the identity it established. NULL
+     * otherwise; the library never looks at it. */
+    void                      *authCtx;
 } oncRPCSvcReq;
 
 /* Dispatch routine for one program version. */
@@ -453,6 +529,59 @@ ONCRPC_API int  oncRPCSvcPeer(const oncRPCSvcReq *req, char *buf, size_t len);
  * transport, as the operating system reports them (Linux, macOS and the
  * BSDs; not Windows). Returns 0, or -1 when they are not known. */
 ONCRPC_API int  oncRPCSvcLocalCred(const oncRPCSvcReq *req, uint32_t *uid, uint32_t *gid);
+
+/*
+ * Authentication. The credential and verifier the request arrived with,
+ * as received (flavor AUTH_NONE with an empty body when there was none);
+ * valid until the request is finished. For AUTH_SYS, req->authSys holds
+ * the credential already decoded.
+ */
+ONCRPC_API const oncRPCAuthData *oncRPCSvcCred(const oncRPCSvcReq *req);
+ONCRPC_API const oncRPCAuthData *oncRPCSvcVerf(const oncRPCSvcReq *req);
+/* The verifier to send with this request's reply (AUTH_NONE, empty, unless
+ * set). len is at most ONCRPC_MAX_AUTH_BYTES. Used by accepted replies,
+ * whether successful or not; rejections carry no verifier. */
+ONCRPC_API oncRPCStat oncRPCSvcSetReplyVerf(oncRPCSvcReq *req, uint32_t flavor,
+                                            const uint8_t *body, uint32_t len);
+
+/*
+ * An authenticator checks every request carrying its flavor before the
+ * request is dispatched. header holds the call from the xid to the end of
+ * the credential, for verifiers that sign it. Returning ONCRPC_AUTH_OK lets
+ * the request through; anything else refuses it with AUTH_ERROR and that
+ * reason. It may call oncRPCSvcSetReplyVerf and set req->authCtx, but must
+ * not finish the request. The request's ctx is not set yet.
+ */
+typedef oncRPCAuthStat (*oncRPCSvcAuthFn)(oncRPCSvcReq *req, const uint8_t *header,
+                                          size_t len, void *ctx);
+/*
+ * Check requests of this flavor with fn (NULL removes the authenticator).
+ * Without one, AUTH_NONE and AUTH_SYS requests are let through and all other
+ * flavors refused with AUTH_REJECTEDCRED; with one, the flavor is accepted
+ * whenever fn says so - so an authenticator for AUTH_NONE can turn away
+ * unauthenticated callers, and one for AUTH_SYS can decide who may call.
+ * AUTH_SYS credentials are decoded before fn runs. AUTH_TLS cannot be
+ * given an authenticator: it is the TLS upgrade itself.
+ */
+ONCRPC_API oncRPCStat oncRPCServerSetAuth(oncRPCServer *srv, uint32_t flavor,
+                                          oncRPCSvcAuthFn fn, void *ctx);
+
+/*
+ * Deferred replies. Non-zero once the request's reply can no longer be
+ * delivered: its connection has closed, or the server is closing. The
+ * request must still be finished (oncRPCSvcDrop is enough).
+ */
+ONCRPC_API int oncRPCSvcAbandoned(const oncRPCSvcReq *req);
+/*
+ * Have cb run, once, when the request becomes abandoned before it is
+ * finished - so that work done for it can be stopped and the request
+ * dropped. cb runs from the event loop, never from inside a library call;
+ * if the request is already abandoned it runs soon after this call. A
+ * server that is closing waits for outstanding requests, so a program that
+ * answers later should finish its requests here. NULL cancels.
+ */
+typedef void (*oncRPCSvcAbandonCb)(oncRPCSvcReq *req, void *data);
+ONCRPC_API void oncRPCSvcSetAbandonCb(oncRPCSvcReq *req, oncRPCSvcAbandonCb cb, void *data);
 
 /* Error replies; each finishes the request. */
 ONCRPC_API void oncRPCSvcErrNoProc(oncRPCSvcReq *req);     /* PROC_UNAVAIL */
